@@ -68,7 +68,10 @@ function requireBody<T>(request: FastifyRequest): T {
 }
 
 function getCurrentUser(request: FastifyRequest, store: InMemoryStore, auth: AuthService): User {
-  const user = requireValue(store.users.get(request.user.sub), 'User not found.', 401);
+  const user = store.users.get(request.user.sub);
+  if (!user) {
+    throw new DomainError('This account has been deleted.', 403, 'ACCOUNT_DELETED');
+  }
   auth.ensureActive(user);
   return user;
 }
@@ -204,8 +207,22 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       options.corsOrigins ??
       process.env.CORS_ORIGINS?.split(',').map((origin) => origin.trim()) ??
       ['http://localhost:5173', 'http://localhost:8081'],
+    allowedHeaders: ['Authorization', 'Content-Type', 'X-CSRF-Token'],
+    methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    maxAge: 600,
   });
-  await app.register(rateLimit, { max: 100, timeWindow: '1 minute' });
+  await app.register(rateLimit, {
+    max: 100,
+    timeWindow: '1 minute',
+    errorResponseBuilder: (_request, context) => {
+      const error = new Error(`Too many requests. Try again in ${context.after}.`);
+      Object.assign(error, {
+        code: 'RATE_LIMITED',
+        statusCode: context.statusCode,
+      });
+      return error;
+    },
+  });
   await app.register(jwt, {
     secret:
       options.jwtSecret ??
@@ -245,6 +262,18 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     if (error instanceof DomainError) {
       return reply.code(error.statusCode).send({ code: error.code, message: error.message });
     }
+
+    if (error instanceof Error) {
+      const httpError = error as Error & { code?: string; statusCode?: number };
+      const statusCode = httpError.statusCode ?? 500;
+      if (statusCode >= 400 && statusCode < 500) {
+        return reply.code(statusCode).send({
+          code: httpError.code === 'RATE_LIMITED' ? httpError.code : 'INVALID_REQUEST',
+          message: httpError.message,
+        });
+      }
+    }
+
     app.log.error(error);
     return reply.code(500).send({ code: 'INTERNAL_ERROR', message: 'Something went wrong.' });
   });
