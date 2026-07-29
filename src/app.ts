@@ -2,23 +2,25 @@ import cors from '@fastify/cors';
 import helmet from '@fastify/helmet';
 import jwt from '@fastify/jwt';
 import rateLimit from '@fastify/rate-limit';
+import * as Sentry from '@sentry/node';
 import Fastify, {
   type FastifyInstance,
   type FastifyReply,
   type FastifyRequest,
 } from 'fastify';
+import { z } from 'zod';
 
 import { DomainError, requireValue } from './domain/errors.js';
 import type {
-  DisputeOutcome,
+  Conversation,
   MediaAttachment,
-  Review,
-  SuitType,
+  Message,
   User,
 } from './domain/types.js';
 import { AuthService, hashPassword, toPublicUser } from './services/auth-service.js';
 import { CommissionService } from './services/commission-service.js';
-import { InMemoryStore } from './store/in-memory-store.js';
+import { MediaService } from './services/media-service.js';
+import { InMemoryStore, type StoreMutation } from './store/in-memory-store.js';
 
 declare module '@fastify/jwt' {
   interface FastifyJWT {
@@ -31,6 +33,10 @@ declare module 'fastify' {
   interface FastifyInstance {
     authenticate: (request: FastifyRequest, reply: FastifyReply) => Promise<void>;
   }
+
+  interface FastifyRequest {
+    storeMutation?: StoreMutation;
+  }
 }
 
 interface AppOptions {
@@ -39,13 +45,7 @@ interface AppOptions {
   corsOrigins?: string[];
   seedDemoData?: boolean;
   logger?: boolean;
-}
-
-interface AuthBody {
-  email: string;
-  password: string;
-  displayName: string;
-  role: 'commissioner' | 'maker';
+  nodeEnv?: string;
 }
 
 const activeStatuses = ['pending', 'negotiating', 'price_proposed', 'accepted', 'active', 'shipping', 'disputed'];
@@ -60,12 +60,93 @@ const documentTypes = [
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
 ];
 
-function requireBody<T>(request: FastifyRequest): T {
+function parseBody<T extends z.ZodType>(
+  request: FastifyRequest,
+  schema: T,
+): z.infer<T> {
   if (!request.body || typeof request.body !== 'object') {
     throw new DomainError('A JSON request body is required.');
   }
-  return request.body as T;
+  return parseValue(request.body, schema);
 }
+
+function parseValue<T extends z.ZodType>(
+  value: unknown,
+  schema: T,
+): z.infer<T> {
+  const result = schema.safeParse(value);
+  if (!result.success) {
+    throw new DomainError(
+      result.error.issues[0]?.message ?? 'The request body is invalid.',
+      400,
+      'INVALID_REQUEST',
+    );
+  }
+  return result.data;
+}
+
+const shortText = z.string().trim().min(1).max(160);
+const noteText = z.string().max(5_000);
+const mediaAttachmentSchema = z.object({
+  url: z.string().url().max(2_048),
+  name: z.string().trim().min(1).max(255),
+  contentType: z.string().trim().min(1).max(120),
+});
+const attachmentsSchema = z.array(mediaAttachmentSchema).max(10).default([]);
+const signupSchema = z.object({
+  email: z.string().trim().email().max(320),
+  password: z.string().min(8).max(128),
+  displayName: shortText,
+  role: z.enum(['commissioner', 'maker']),
+});
+const loginSchema = signupSchema.pick({ email: true, password: true });
+const profileSchema = z.object({
+  displayName: shortText.optional(),
+  bio: z.string().trim().max(2_000).optional(),
+  avatarUrl: z.string().url().max(2_048).optional(),
+  pushToken: z.string().trim().max(512).optional(),
+});
+const priceSchema = z.object({
+  head: z.number().finite().nonnegative(),
+  partial: z.number().finite().nonnegative(),
+  full: z.number().finite().nonnegative(),
+});
+const addOnPriceSchema = z.object({
+  movingJaw: z.number().finite().nonnegative(),
+  followMeEyes: z.number().finite().nonnegative(),
+  coolingFan: z.number().finite().nonnegative(),
+});
+const makerProfileSchema = z.object({
+  bio: z.string().trim().max(2_000).optional(),
+  location: z.string().trim().max(160).optional(),
+  specialisms: z.array(z.string().trim().min(1).max(60)).max(20).optional(),
+  basePrices: priceSchema.optional(),
+  addOnPrices: addOnPriceSchema.optional(),
+  turnaroundWeeks: z.number().int().min(0).max(520).optional(),
+  queueOpen: z.boolean().optional(),
+  bannerUrl: z.string().url().max(2_048).optional(),
+});
+const commissionSchema = z.object({
+  makerId: z.string().min(1).max(160),
+  title: shortText,
+  suitType: z.enum(['head', 'partial', 'full', 'custom']),
+  species: shortText,
+  description: z.string().trim().min(1).max(5_000),
+  referenceNotes: z.string().trim().max(5_000).default(''),
+  budget: z.number().finite().positive().max(10_000_000),
+});
+const reviewSchema = z.object({
+  quality: z.number().int().min(1).max(5),
+  communication: z.number().int().min(1).max(5),
+  accuracy: z.number().int().min(1).max(5),
+  packaging: z.number().int().min(1).max(5),
+  timeline: z.number().int().min(1).max(5),
+  comment: z.string().trim().max(5_000),
+});
+const messageSchema = z.object({
+  text: noteText.optional().default(''),
+  attachments: attachmentsSchema,
+});
 
 function getCurrentUser(request: FastifyRequest, store: InMemoryStore, auth: AuthService): User {
   const user = store.users.get(request.user.sub);
@@ -80,6 +161,87 @@ function assertAdmin(user: User): void {
   if (user.role !== 'admin') {
     throw new DomainError('Admin access required.', 403, 'FORBIDDEN');
   }
+}
+
+function marketplaceUser(user: User) {
+  const { email: _email, ...publicUser } = toPublicUser(user);
+  return publicUser;
+}
+
+function getOrCreateAdminConversation(
+  store: InMemoryStore,
+  userId: string,
+  adminId?: string,
+): Conversation {
+  const existing = [...store.conversations.values()].find(
+    (conversation) =>
+      conversation.kind === 'admin' && conversation.participantIds.includes(userId),
+  );
+  if (existing) {
+    if (adminId && !existing.participantIds.includes(adminId)) {
+      existing.participantIds.push(adminId);
+    }
+    return existing;
+  }
+
+  const conversation: Conversation = {
+    id: crypto.randomUUID(),
+    kind: 'admin',
+    participantIds: adminId ? [userId, adminId] : [userId],
+    createdAt: new Date().toISOString(),
+  };
+  store.conversations.set(conversation.id, conversation);
+  return conversation;
+}
+
+function createMessage(
+  store: InMemoryStore,
+  conversation: Conversation,
+  sender: User,
+  text: string,
+  attachments: MediaAttachment[] = [],
+): Message {
+  if ((!text.trim() && attachments.length === 0) || text.length > 5_000) {
+    throw new DomainError('A message needs up to 5,000 characters or an attachment.');
+  }
+  if (attachments.length > 10) {
+    throw new DomainError('A message can contain at most 10 attachments.');
+  }
+
+  const message: Message = {
+    id: crypto.randomUUID(),
+    conversationId: conversation.id,
+    senderId: sender.id,
+    text: text.trim(),
+    attachments,
+    createdAt: new Date().toISOString(),
+  };
+  store.messages.push(message);
+
+  const recipientIds =
+    conversation.kind === 'admin'
+      ? [
+          ...conversation.participantIds,
+          ...[...store.users.values()]
+            .filter((user) => user.role === 'admin' && user.status === 'active')
+            .map((user) => user.id),
+        ]
+      : conversation.participantIds;
+  [...new Set(recipientIds)]
+    .filter((userId) => userId !== sender.id)
+    .forEach((userId) => {
+      store.notifications.push({
+        id: crypto.randomUUID(),
+        userId,
+        type: 'message_received',
+        title: conversation.kind === 'admin' ? 'New support message' : 'New message',
+        body: message.text || 'An attachment was sent.',
+        read: false,
+        createdAt: message.createdAt,
+      });
+    });
+
+  return message;
 }
 
 function serializeMaker(store: InMemoryStore, user: User) {
@@ -104,7 +266,7 @@ function serializeMaker(store: InMemoryStore, user: User) {
   ).length;
 
   return {
-    user: toPublicUser(user),
+    user: marketplaceUser(user),
     profile,
     rating,
     completedCount,
@@ -188,8 +350,45 @@ async function seedStore(store: InMemoryStore): Promise<void> {
 
 // Builds an isolated server so automated tests never need a listening network port.
 export async function buildApp(options: AppOptions = {}): Promise<FastifyInstance> {
+  const nodeEnv = options.nodeEnv ?? process.env.NODE_ENV ?? 'development';
+  const jwtSecret =
+    options.jwtSecret ??
+    process.env.JWT_SECRET ??
+    (nodeEnv === 'production' ? '' : 'development-only-secret-change-before-production');
+  const seedDemoData = options.seedDemoData ?? process.env.SEED_DEMO_DATA === 'true';
+  const corsOrigins =
+    options.corsOrigins ??
+    process.env.CORS_ORIGINS?.split(',').map((origin) => origin.trim()).filter(Boolean) ??
+    ['http://localhost:5173', 'http://localhost:8081'];
+
+  if (nodeEnv === 'production' && jwtSecret.length < 32) {
+    throw new Error('JWT_SECRET must contain at least 32 characters in production.');
+  }
+  if (nodeEnv === 'production' && seedDemoData) {
+    throw new Error('SEED_DEMO_DATA must be false in production.');
+  }
+  if (nodeEnv === 'production' && (corsOrigins.length === 0 || corsOrigins.includes('*'))) {
+    throw new Error('CORS_ORIGINS must contain explicit trusted origins in production.');
+  }
+  for (const origin of corsOrigins) {
+    const parsed = new URL(origin);
+    if (
+      parsed.origin !== origin.replace(/\/$/, '') ||
+      (nodeEnv === 'production' && parsed.protocol !== 'https:')
+    ) {
+      throw new Error('CORS_ORIGINS entries must be exact trusted origins.');
+    }
+  }
+
   const store = options.store ?? new InMemoryStore();
-  if (options.seedDemoData ?? process.env.SEED_DEMO_DATA !== 'false') {
+  const media = MediaService.fromEnvironment();
+  if (nodeEnv === 'production' && !media) {
+    throw new Error('Cloudflare R2 configuration is required in production.');
+  }
+  if (seedDemoData && store.persistent) {
+    throw new Error('SEED_DEMO_DATA can only be used with the in-memory development store.');
+  }
+  if (seedDemoData) {
     await seedStore(store);
   }
 
@@ -203,10 +402,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
 
   await app.register(helmet);
   await app.register(cors, {
-    origin:
-      options.corsOrigins ??
-      process.env.CORS_ORIGINS?.split(',').map((origin) => origin.trim()) ??
-      ['http://localhost:5173', 'http://localhost:8081'],
+    origin: corsOrigins,
     allowedHeaders: ['Authorization', 'Content-Type', 'X-CSRF-Token'],
     methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     maxAge: 600,
@@ -224,11 +420,29 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     },
   });
   await app.register(jwt, {
-    secret:
-      options.jwtSecret ??
-      process.env.JWT_SECRET ??
-      'development-only-secret-change-before-production',
+    secret: jwtSecret,
     sign: { expiresIn: '30d' },
+  });
+
+  app.addHook('onRequest', async (request) => {
+    if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method)) {
+      request.storeMutation = await store.beginMutation();
+    }
+  });
+  app.addHook('onError', async (request) => {
+    request.storeMutation?.rollback();
+    delete request.storeMutation;
+  });
+  app.addHook('onSend', async (request, reply, payload) => {
+    const mutation = request.storeMutation;
+    delete request.storeMutation;
+    if (!mutation) return payload;
+    if (reply.statusCode >= 400) {
+      mutation.rollback();
+      return payload;
+    }
+    await mutation.commit();
+    return payload;
   });
 
   app.decorate('authenticate', async (request, reply) => {
@@ -258,711 +472,4 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     }
   };
 
-  app.setErrorHandler((error, _request, reply) => {
-    if (error instanceof DomainError) {
-      return reply.code(error.statusCode).send({ code: error.code, message: error.message });
-    }
-
-    if (error instanceof Error) {
-      const httpError = error as Error & { code?: string; statusCode?: number };
-      const statusCode = httpError.statusCode ?? 500;
-      if (statusCode >= 400 && statusCode < 500) {
-        return reply.code(statusCode).send({
-          code: httpError.code === 'RATE_LIMITED' ? httpError.code : 'INVALID_REQUEST',
-          message: httpError.message,
-        });
-      }
-    }
-
-    app.log.error(error);
-    return reply.code(500).send({ code: 'INTERNAL_ERROR', message: 'Something went wrong.' });
-  });
-
-  app.get('/health', async () => ({ status: 'ok', service: 'ruffl-api' }));
-
-  app.post(
-    '/auth/signup',
-    { config: { rateLimit: { max: 5, timeWindow: '1 hour' } } },
-    async (request, reply) => {
-      const body = requireBody<AuthBody>(request);
-      const user = await auth.signup(body);
-      const token = app.jwt.sign({ sub: user.id, role: user.role });
-      return reply.code(201).send({ token, user: toPublicUser(user) });
-    },
-  );
-
-  app.post(
-    '/auth/login',
-    { config: { rateLimit: { max: 10, timeWindow: '15 minutes' } } },
-    async (request) => {
-      const body = requireBody<Pick<AuthBody, 'email' | 'password'>>(request);
-      const user = await auth.login(body.email, body.password);
-      return { token: app.jwt.sign({ sub: user.id, role: user.role }), user: toPublicUser(user) };
-    },
-  );
-
-  app.get('/me', { onRequest: [app.authenticate] }, async (request) => {
-    const user = getCurrentUser(request, store, auth);
-    return {
-      user: toPublicUser(user),
-      makerProfile: store.makerProfiles.get(user.id) ?? null,
-      warnings: store.warnings.filter((warning) => warning.userId === user.id && !warning.read),
-    };
-  });
-
-  app.patch('/me', { onRequest: [app.authenticate] }, async (request) => {
-    const user = getCurrentUser(request, store, auth);
-    const body = requireBody<{
-      displayName?: string;
-      bio?: string;
-      avatarUrl?: string;
-      pushToken?: string;
-    }>(request);
-    if (body.displayName !== undefined) user.displayName = body.displayName.trim();
-    if (body.bio !== undefined) user.bio = body.bio.trim();
-    if (body.avatarUrl !== undefined) user.avatarUrl = body.avatarUrl;
-    if (body.pushToken !== undefined) user.pushToken = body.pushToken;
-    return { user: toPublicUser(user) };
-  });
-
-  app.delete('/me', { onRequest: [app.authenticate] }, async (request) => {
-    const user = getCurrentUser(request, store, auth);
-    const hasActiveCommission = [...store.commissions.values()].some(
-      (commission) =>
-        activeStatuses.includes(commission.status) &&
-        (commission.makerId === user.id || commission.commissionerId === user.id),
-    );
-    if (hasActiveCommission) {
-      throw new DomainError('Finish or cancel active commissions before deleting your account.');
-    }
-    user.status = 'deleted';
-    return { deleted: true };
-  });
-
-  app.get('/makers', async (request) => {
-    const query = request.query as { search?: string; openOnly?: string };
-    const search = query.search?.trim().toLowerCase() ?? '';
-    return [...store.users.values()]
-      .filter((user) => user.role === 'maker' && user.status === 'active')
-      .map((user) => serializeMaker(store, user))
-      .filter(({ user, profile }) => {
-        const matchesSearch =
-          !search ||
-          user.displayName.toLowerCase().includes(search) ||
-          profile.specialisms.some((tag) => tag.toLowerCase().includes(search));
-        return matchesSearch && (query.openOnly !== 'true' || profile.queueOpen);
-      });
-  });
-
-  app.get('/makers/:makerId', async (request) => {
-    const { makerId } = request.params as { makerId: string };
-    const user = requireValue(store.users.get(makerId), 'Maker not found.');
-    if (user.role !== 'maker' || user.status !== 'active') {
-      throw new DomainError('Maker not found.', 404, 'NOT_FOUND');
-    }
-    return serializeMaker(store, user);
-  });
-
-  app.patch('/maker-profile', { onRequest: [app.authenticate] }, async (request) => {
-    const user = getCurrentUser(request, store, auth);
-    if (user.role !== 'maker') throw new DomainError('Maker access required.', 403, 'FORBIDDEN');
-    const profile = requireValue(store.makerProfiles.get(user.id), 'Maker profile not found.');
-    const body = requireBody<Partial<typeof profile>>(request);
-    Object.assign(profile, body, { userId: user.id });
-    return { profile };
-  });
-
-  app.post('/makers/:makerId/waitlist', { onRequest: [app.authenticate] }, async (request, reply) => {
-    const user = getCurrentUser(request, store, auth);
-    const { makerId } = request.params as { makerId: string };
-    const { message = '' } = requireBody<{ message?: string }>(request);
-    if (user.role !== 'commissioner') {
-      throw new DomainError('Only commissioners can join a waitlist.', 403, 'FORBIDDEN');
-    }
-    const profile = requireValue(store.makerProfiles.get(makerId), 'Maker not found.');
-    if (profile.queueOpen) throw new DomainError('This maker is currently accepting requests.');
-    if (
-      store.waitlist.some(
-        (entry) => entry.makerId === makerId && entry.commissionerId === user.id,
-      )
-    ) {
-      throw new DomainError('You are already on this waitlist.', 409, 'DUPLICATE_WAITLIST');
-    }
-    const entry = {
-      id: crypto.randomUUID(),
-      makerId,
-      commissionerId: user.id,
-      message: message.trim(),
-      createdAt: new Date().toISOString(),
-    };
-    store.waitlist.push(entry);
-    return reply.code(201).send({ entry });
-  });
-
-  app.get('/maker-profile/waitlist', { onRequest: [app.authenticate] }, async (request) => {
-    const user = getCurrentUser(request, store, auth);
-    if (user.role !== 'maker') throw new DomainError('Maker access required.', 403, 'FORBIDDEN');
-    return store.waitlist.filter((entry) => entry.makerId === user.id);
-  });
-
-  app.post('/commissions', { onRequest: [app.authenticate] }, async (request, reply) => {
-    const user = getCurrentUser(request, store, auth);
-    const commission = commissions.create(
-      user,
-      requireBody<{
-        makerId: string;
-        title: string;
-        suitType: SuitType;
-        species: string;
-        description: string;
-        referenceNotes?: string;
-        budget: number;
-      }>(request),
-    );
-    return reply.code(201).send({ commission });
-  });
-
-  app.get('/commissions', { onRequest: [app.authenticate] }, async (request) => ({
-    commissions: commissions.listForUser(getCurrentUser(request, store, auth)),
-  }));
-
-  app.get('/commissions/:id', { onRequest: [app.authenticate] }, async (request) => {
-    const user = getCurrentUser(request, store, auth);
-    const { id } = request.params as { id: string };
-    return {
-      ...commissions.getForUser(user, id),
-      negotiations: store.negotiations.filter((entry) => entry.commissionId === id),
-      materials: store.materials.filter((entry) => entry.commissionId === id),
-      dispute: [...store.disputes.values()].find((dispute) => dispute.commissionId === id) ?? null,
-    };
-  });
-
-  app.post('/commissions/:id/respond', { onRequest: [app.authenticate] }, async (request) => {
-    const { id } = request.params as { id: string };
-    const { accept } = requireBody<{ accept: boolean }>(request);
-    return { commission: commissions.respondToRequest(getCurrentUser(request, store, auth), id, accept) };
-  });
-
-  app.post('/commissions/:id/price', { onRequest: [app.authenticate] }, async (request) => {
-    const { id } = request.params as { id: string };
-    const { amount, note } = requireBody<{ amount: number; note?: string }>(request);
-    return {
-      commission: commissions.proposePrice(getCurrentUser(request, store, auth), id, amount, note),
-    };
-  });
-
-  app.post('/commissions/:id/price-response', { onRequest: [app.authenticate] }, async (request) => {
-    const { id } = request.params as { id: string };
-    const { accept, note } = requireBody<{ accept: boolean; note?: string }>(request);
-    return {
-      commission: commissions.respondToPrice(getCurrentUser(request, store, auth), id, accept, note),
-    };
-  });
-
-  app.post('/commissions/:id/deposit', { onRequest: [app.authenticate] }, async (request) => {
-    const { id } = request.params as { id: string };
-    return { commission: commissions.payDeposit(getCurrentUser(request, store, auth), id) };
-  });
-
-  app.post(
-    '/commissions/:id/milestones/:milestoneId/updates',
-    { onRequest: [app.authenticate] },
-    async (request) => {
-      const { id, milestoneId } = request.params as { id: string; milestoneId: string };
-      const { notes, attachments } = requireBody<{
-        notes: string;
-        attachments?: MediaAttachment[];
-      }>(request);
-      return {
-        milestone: commissions.postMilestoneUpdate(
-          getCurrentUser(request, store, auth),
-          id,
-          milestoneId,
-          notes,
-          attachments,
-        ),
-      };
-    },
-  );
-
-  app.post(
-    '/commissions/:id/milestones/:milestoneId/approve',
-    { onRequest: [app.authenticate] },
-    async (request) => {
-      const { id, milestoneId } = request.params as { id: string; milestoneId: string };
-      return {
-        milestone: commissions.approveMilestone(
-          getCurrentUser(request, store, auth),
-          id,
-          milestoneId,
-        ),
-      };
-    },
-  );
-
-  app.post('/commissions/:id/ship', { onRequest: [app.authenticate] }, async (request) => {
-    const { id } = request.params as { id: string };
-    const { trackingNumber } = requireBody<{ trackingNumber?: string }>(request);
-    return {
-      commission: commissions.ship(getCurrentUser(request, store, auth), id, trackingNumber),
-    };
-  });
-
-  app.post('/commissions/:id/receipt', { onRequest: [app.authenticate] }, async (request) => {
-    const { id } = request.params as { id: string };
-    return { commission: commissions.confirmReceipt(getCurrentUser(request, store, auth), id) };
-  });
-
-  app.post('/commissions/:id/cancel', { onRequest: [app.authenticate] }, async (request) => {
-    const { id } = request.params as { id: string };
-    return { commission: commissions.cancel(getCurrentUser(request, store, auth), id) };
-  });
-
-  app.post('/commissions/:id/reviews', { onRequest: [app.authenticate] }, async (request, reply) => {
-    const { id } = request.params as { id: string };
-    const review = commissions.addReview(
-      getCurrentUser(request, store, auth),
-      id,
-      requireBody<Omit<Review, 'id' | 'commissionId' | 'reviewerId' | 'revieweeId' | 'createdAt'>>(
-        request,
-      ),
-    );
-    return reply.code(201).send({ review });
-  });
-
-  app.post('/commissions/:id/materials', { onRequest: [app.authenticate] }, async (request, reply) => {
-    const user = getCurrentUser(request, store, auth);
-    const { id } = request.params as { id: string };
-    const { commission } = commissions.getForUser(user, id);
-    if (user.id !== commission.makerId) {
-      throw new DomainError('Only the maker can track material costs.', 403, 'FORBIDDEN');
-    }
-    const body = requireBody<{
-      item: string;
-      quantity: number;
-      unit: string;
-      costPerUnit: number;
-    }>(request);
-    if (!body.item.trim() || body.quantity <= 0 || body.costPerUnit < 0) {
-      throw new DomainError('Enter a valid item, quantity, and cost.');
-    }
-    const entry = {
-      id: crypto.randomUUID(),
-      commissionId: id,
-      makerId: user.id,
-      item: body.item.trim(),
-      quantity: body.quantity,
-      unit: body.unit.trim(),
-      costPerUnit: body.costPerUnit,
-      createdAt: new Date().toISOString(),
-    };
-    store.materials.push(entry);
-    return reply.code(201).send({ entry });
-  });
-
-  app.post('/commissions/:id/disputes', { onRequest: [app.authenticate] }, async (request, reply) => {
-    const user = getCurrentUser(request, store, auth);
-    const { id } = request.params as { id: string };
-    const { explanation, attachments } = requireBody<{
-      explanation: string;
-      attachments?: MediaAttachment[];
-    }>(request);
-    return reply
-      .code(201)
-      .send({ dispute: commissions.raiseDispute(user, id, explanation, attachments) });
-  });
-
-  app.post('/disputes/:id/evidence', { onRequest: [app.authenticate] }, async (request) => {
-    const user = getCurrentUser(request, store, auth);
-    const { id } = request.params as { id: string };
-    const { message, attachments } = requireBody<{
-      message: string;
-      attachments?: MediaAttachment[];
-    }>(request);
-    return { dispute: commissions.addEvidence(user, id, message, attachments) };
-  });
-
-  app.get('/conversations', { onRequest: [app.authenticate] }, async (request) => {
-    const user = getCurrentUser(request, store, auth);
-    const conversations = [...store.conversations.values()].filter(
-      (conversation) =>
-        user.role === 'admin' ||
-        conversation.participantIds.includes(user.id) ||
-        conversation.kind === 'admin',
-    );
-    return {
-      conversations: conversations.map((conversation) => ({
-        ...conversation,
-        lastMessage:
-          store.messages
-            .filter((message) => message.conversationId === conversation.id)
-            .at(-1) ?? null,
-      })),
-    };
-  });
-
-  app.get('/conversations/:id/messages', { onRequest: [app.authenticate] }, async (request) => {
-    const user = getCurrentUser(request, store, auth);
-    const { id } = request.params as { id: string };
-    const conversation = requireValue(store.conversations.get(id), 'Conversation not found.');
-    if (user.role !== 'admin' && !conversation.participantIds.includes(user.id)) {
-      throw new DomainError('You are not part of this conversation.', 403, 'FORBIDDEN');
-    }
-    return { messages: store.messages.filter((message) => message.conversationId === id) };
-  });
-
-  app.post(
-    '/conversations/:id/messages',
-    { onRequest: [app.authenticate] },
-    async (request, reply) => {
-      const user = getCurrentUser(request, store, auth);
-      const { id } = request.params as { id: string };
-      const conversation = requireValue(store.conversations.get(id), 'Conversation not found.');
-      if (user.role !== 'admin' && !conversation.participantIds.includes(user.id)) {
-        throw new DomainError('You are not part of this conversation.', 403, 'FORBIDDEN');
-      }
-      const { text = '', attachments = [] } = requireBody<{
-        text?: string;
-        attachments?: MediaAttachment[];
-      }>(request);
-      if (!text.trim() && attachments.length === 0) {
-        throw new DomainError('A message needs text or an attachment.');
-      }
-      const message = {
-        id: crypto.randomUUID(),
-        conversationId: id,
-        senderId: user.id,
-        text: text.trim(),
-        attachments,
-        createdAt: new Date().toISOString(),
-      };
-      store.messages.push(message);
-      return reply.code(201).send({ message });
-    },
-  );
-
-  app.get('/notifications', { onRequest: [app.authenticate] }, async (request) => {
-    const user = getCurrentUser(request, store, auth);
-    return { notifications: store.notifications.filter((item) => item.userId === user.id) };
-  });
-
-  app.post('/warnings/:id/read', { onRequest: [app.authenticate] }, async (request) => {
-    const user = getCurrentUser(request, store, auth);
-    const { id } = request.params as { id: string };
-    const warning = requireValue(
-      store.warnings.find((item) => item.id === id && item.userId === user.id),
-      'Warning not found.',
-    );
-    warning.read = true;
-    return { warning };
-  });
-
-  app.post(
-    '/uploads/slot',
-    {
-      onRequest: [app.authenticate],
-      config: { rateLimit: { max: 20, timeWindow: '1 hour' } },
-    },
-    async (request) => {
-      const user = getCurrentUser(request, store, auth);
-      const { fileName, contentType, size, category } = requireBody<{
-        fileName: string;
-        contentType: string;
-        size: number;
-        category: 'image' | 'video' | 'document' | 'avatar' | 'banner';
-      }>(request);
-      const allowed =
-        category === 'video'
-          ? videoTypes
-          : category === 'document'
-            ? documentTypes
-            : imageTypes;
-      const limit =
-        category === 'video' ? 100 * 1024 * 1024 : category === 'document' ? 25 * 1024 * 1024 : 10 * 1024 * 1024;
-      if (!allowed.includes(contentType) || size <= 0 || size > limit) {
-        throw new DomainError('This file type or size is not allowed.');
-      }
-      const safeName = fileName.replace(/[^a-zA-Z0-9._-]/g, '-');
-      const objectKey =
-        category === 'avatar' || category === 'banner'
-          ? `${category}s/${user.id}`
-          : `uploads/${user.id}/${crypto.randomUUID()}-${safeName}`;
-      const publicBase = process.env.R2_PUBLIC_URL ?? 'https://media.example.test';
-      return {
-        slot: {
-          uploadUrl: `${publicBase}/development-upload/${objectKey}`,
-          publicUrl: `${publicBase}/${objectKey}`,
-          expiresInSeconds: 300,
-          method: 'PUT',
-          headers: { 'Content-Type': contentType },
-          developmentOnly: !process.env.R2_ACCOUNT_ID,
-        },
-      };
-    },
-  );
-
-  app.get('/admin/overview', { onRequest: [app.authenticate] }, async (request) => {
-    const user = getCurrentUser(request, store, auth);
-    assertAdmin(user);
-    return {
-      counts: {
-        users: store.users.size,
-        activeCommissions: [...store.commissions.values()].filter((commission) =>
-          activeStatuses.includes(commission.status),
-        ).length,
-        openDisputes: [...store.disputes.values()].filter((dispute) =>
-          ['open', 'under_review'].includes(dispute.status),
-        ).length,
-        unreadAdminChats: 0,
-      },
-      recentCommissions: [...store.commissions.values()].slice(-5).reverse(),
-      recentDisputes: [...store.disputes.values()].slice(-5).reverse(),
-    };
-  });
-
-  app.get('/admin/csrf', { onRequest: [app.authenticate] }, async (request) => {
-    const admin = getCurrentUser(request, store, auth);
-    assertAdmin(admin);
-    return {
-      csrfToken: app.jwt.sign(
-        { sub: admin.id, role: admin.role, scope: 'csrf' },
-        { expiresIn: '10m' },
-      ),
-      expiresInSeconds: 600,
-    };
-  });
-
-  app.get('/admin/users', { onRequest: [app.authenticate] }, async (request) => {
-    const admin = getCurrentUser(request, store, auth);
-    assertAdmin(admin);
-    const query = request.query as { search?: string; status?: User['status'] };
-    const search = query.search?.toLowerCase() ?? '';
-    return {
-      users: [...store.users.values()]
-        .filter(
-          (user) =>
-            (!query.status || user.status === query.status) &&
-            (!search ||
-              user.email.includes(search) ||
-              user.displayName.toLowerCase().includes(search)),
-        )
-        .map(toPublicUser),
-    };
-  });
-
-  app.post(
-    '/admin/users/:id/warn',
-    { onRequest: [app.authenticate], preHandler: [requireAdminCsrf] },
-    async (request, reply) => {
-    const admin = getCurrentUser(request, store, auth);
-    assertAdmin(admin);
-    const { id } = request.params as { id: string };
-    const { message } = requireBody<{ message: string }>(request);
-    const target = requireValue(store.users.get(id), 'User not found.');
-    if (!message.trim()) throw new DomainError('Warning message is required.');
-    const warning = {
-      id: crypto.randomUUID(),
-      userId: target.id,
-      adminId: admin.id,
-      message: message.trim(),
-      read: false,
-      createdAt: new Date().toISOString(),
-    };
-    store.warnings.push(warning);
-    store.notifications.push({
-      id: crypto.randomUUID(),
-      userId: target.id,
-      type: 'admin_warning',
-      title: 'Message from Ruffl support',
-      body: warning.message,
-      read: false,
-      createdAt: warning.createdAt,
-    });
-    return reply.code(201).send({ warning });
-    },
-  );
-
-  app.post(
-    '/admin/users/:id/suspend',
-    { onRequest: [app.authenticate], preHandler: [requireAdminCsrf] },
-    async (request) => {
-    const admin = getCurrentUser(request, store, auth);
-    assertAdmin(admin);
-    const { id } = request.params as { id: string };
-    const { hours, reason } = requireBody<{ hours: number; reason: string }>(request);
-    const target = requireValue(store.users.get(id), 'User not found.');
-    if (target.role === 'admin' || hours <= 0 || !reason.trim()) {
-      throw new DomainError('Enter a positive duration and reason for a non-admin user.');
-    }
-    target.status = 'suspended';
-    target.suspendedUntil = new Date(Date.now() + hours * 3_600_000).toISOString();
-    target.suspensionReason = reason.trim();
-    return { user: toPublicUser(target) };
-    },
-  );
-
-  app.post(
-    '/admin/users/:id/unsuspend',
-    { onRequest: [app.authenticate], preHandler: [requireAdminCsrf] },
-    async (request) => {
-    const admin = getCurrentUser(request, store, auth);
-    assertAdmin(admin);
-    const { id } = request.params as { id: string };
-    const target = requireValue(store.users.get(id), 'User not found.');
-    target.status = 'active';
-    delete target.suspendedUntil;
-    delete target.suspensionReason;
-    return { user: toPublicUser(target) };
-    },
-  );
-
-  app.delete(
-    '/admin/users/:id',
-    { onRequest: [app.authenticate], preHandler: [requireAdminCsrf] },
-    async (request) => {
-    const admin = getCurrentUser(request, store, auth);
-    assertAdmin(admin);
-    const { id } = request.params as { id: string };
-    const body = (request.body ?? {}) as { permanent?: boolean };
-    const target = requireValue(store.users.get(id), 'User not found.');
-    if (target.role === 'admin') throw new DomainError('Admin accounts cannot be removed here.');
-    if (!body.permanent) {
-      target.status = 'deleted';
-      return { deleted: true, permanent: false };
-    }
-    if (target.status !== 'deleted') {
-      throw new DomainError('Soft-delete the account before permanent deletion.');
-    }
-    const commissionIds = new Set(
-      [...store.commissions.values()]
-        .filter((commission) => commission.makerId === id || commission.commissionerId === id)
-        .map((commission) => commission.id),
-    );
-    const disputeIds = new Set(
-      [...store.disputes.values()]
-        .filter((dispute) => commissionIds.has(dispute.commissionId) || dispute.raisedById === id)
-        .map((dispute) => dispute.id),
-    );
-    const conversationIds = new Set(
-      [...store.conversations.values()]
-        .filter(
-          (conversation) =>
-            conversation.participantIds.includes(id) ||
-            (conversation.commissionId ? commissionIds.has(conversation.commissionId) : false) ||
-            (conversation.disputeId ? disputeIds.has(conversation.disputeId) : false),
-        )
-        .map((conversation) => conversation.id),
-    );
-
-    commissionIds.forEach((commissionId) => {
-      store.commissions.delete(commissionId);
-      store.milestones.delete(commissionId);
-    });
-    disputeIds.forEach((disputeId) => store.disputes.delete(disputeId));
-    conversationIds.forEach((conversationId) => store.conversations.delete(conversationId));
-    store.users.delete(id);
-    store.makerProfiles.delete(id);
-    store.negotiations.splice(
-      0,
-      store.negotiations.length,
-      ...store.negotiations.filter(
-        (item) => item.authorId !== id && !commissionIds.has(item.commissionId),
-      ),
-    );
-    store.messages.splice(
-      0,
-      store.messages.length,
-      ...store.messages.filter(
-        (item) => item.senderId !== id && !conversationIds.has(item.conversationId),
-      ),
-    );
-    store.reviews.splice(
-      0,
-      store.reviews.length,
-      ...store.reviews.filter(
-        (item) =>
-          item.reviewerId !== id &&
-          item.revieweeId !== id &&
-          !commissionIds.has(item.commissionId),
-      ),
-    );
-    store.materials.splice(
-      0,
-      store.materials.length,
-      ...store.materials.filter(
-        (item) => item.makerId !== id && !commissionIds.has(item.commissionId),
-      ),
-    );
-    store.waitlist.splice(
-      0,
-      store.waitlist.length,
-      ...store.waitlist.filter(
-        (item) => item.makerId !== id && item.commissionerId !== id,
-      ),
-    );
-    store.warnings.splice(
-      0,
-      store.warnings.length,
-      ...store.warnings.filter((item) => item.userId !== id && item.adminId !== id),
-    );
-    store.notifications.splice(
-      0,
-      store.notifications.length,
-      ...store.notifications.filter((item) => item.userId !== id),
-    );
-    return { deleted: true, permanent: true };
-    },
-  );
-
-  app.get('/admin/disputes', { onRequest: [app.authenticate] }, async (request) => {
-    const admin = getCurrentUser(request, store, auth);
-    assertAdmin(admin);
-    return {
-      disputes: [...store.disputes.values()].map((dispute) => ({
-        ...dispute,
-        commission: store.commissions.get(dispute.commissionId),
-        materials: store.materials.filter((entry) => entry.commissionId === dispute.commissionId),
-      })),
-    };
-  });
-
-  app.post(
-    '/admin/disputes/:id/assign',
-    { onRequest: [app.authenticate], preHandler: [requireAdminCsrf] },
-    async (request) => {
-    const { id } = request.params as { id: string };
-    return { dispute: commissions.assignDispute(getCurrentUser(request, store, auth), id) };
-    },
-  );
-
-  app.post(
-    '/admin/disputes/:id/resolve',
-    { onRequest: [app.authenticate], preHandler: [requireAdminCsrf] },
-    async (request) => {
-    const { id } = request.params as { id: string };
-    const { outcome, resolution } = requireBody<{
-      outcome: DisputeOutcome;
-      resolution: string;
-    }>(request);
-    return {
-      dispute: commissions.resolveDispute(
-        getCurrentUser(request, store, auth),
-        id,
-        outcome,
-        resolution,
-      ),
-    };
-    },
-  );
-
-  app.post(
-    '/admin/disputes/:id/close',
-    { onRequest: [app.authenticate], preHandler: [requireAdminCsrf] },
-    async (request) => {
-    const { id } = request.params as { id: string };
-    return { dispute: commissions.closeDispute(getCurrentUser(request, store, auth), id) };
-    },
-  );
-
-  return app;
-}
+  app.sç}w¶‰žËkºwµçM¥Á…¹Ð¹¥€ôôôÕÍ•È¹¥(€€€€¤ì(€€€€€Ñ¡É½Ü¹•Ü½µ…¥¹ÉÉ½È ¡½½Í”…¹½Ñ¡•È…Ñ¥Ù”µ…É­•ÑÁ±…”ÕÍ•È¸œ¤ì(€€€ô(€€€½¹ÍÐ•á¥ÍÑ¥¹œ€ôl¸¸¹ÍÑ½É”¹½¹Ù•ÉÍ…Ñ¥½¹Ì¹Ù…±Õ•Ì ¥t¹™¥¹ (€€€€€€¡½¹Ù•ÉÍ…Ñ¥½¸¤€ôø(€€€€€€€½¹Ù•ÉÍ…Ñ¥½¸¹­¥¹€ôôô€‘¥É•Ðœ€˜˜(€€€€€€€½¹Ù•ÉÍ…Ñ¥½¸¹Á…ÉÑ¥¥Á…¹Ñ%‘Ì¹±•¹Ñ €ôôô€È€˜˜(€€€€€€€½¹Ù•ÉÍ…Ñ¥½¸¹Á…ÉÑ¥¥Á…¹Ñ%‘Ì¹¥¹±Õ‘•Ì¡ÕÍ•È¹¥¤€˜˜(€€€€€€€½¹Ù•ÉÍ…Ñ¥½¸¹Á…ÉÑ¥¥Á…¹Ñ%‘Ì¹¥¹±Õ‘•Ì¡Á…ÉÑ¥¥Á…¹Ð¹¥¤°(€€€€¤ì(€€€¥˜€¡•á¥ÍÑ¥¹œ¤É•ÑÕÉ¸ì½¹Ù•ÉÍ…Ñ¥½¸è•á¥ÍÑ¥¹œôì((€€€½¹ÍÐ½¹Ù•ÉÍ…Ñ¥½¸è½¹Ù•ÉÍ…Ñ¥½¸€ôì(€€€€€¥èÉåÁÑ¼¹É…¹‘½µUU% ¤°(€€€€€­¥¹è€‘¥É•Ðœ°(€€€€€Á…ÉÑ¥¥Á…¹Ñ%‘ÌèmÕÍ•È¹¥°Á…ÉÑ¥¥Á…¹Ð¹¥‘t°(€€€€€É•…Ñ•‘Ðè¹•Ü…Ñ” ¤¹Ñ½%M=MÑÉ¥¹œ ¤°(€€€ôì(€€€ÍÑ½É”¹½¹Ù•ÉÍ…Ñ¥½¹Ì¹Í•Ð¡½¹Ù•ÉÍ…Ñ¥½¸¹¥°½¹Ù•ÉÍ…Ñ¥½¸¤ì(€€€É•ÑÕÉ¸É•Á±ä¹½‘” ÈÀÄ¤¹Í•¹¡ì½¹Ù•ÉÍ…Ñ¥½¸ô¤ì(€ô¤ì((€…ÁÀ¹Á½ÍÐ œ½ÍÕÁÁ½ÉÐ½½¹Ù•ÉÍ…Ñ¥½¸œ°ì½¹I•ÅÕ•ÍÐèm…ÁÀ¹…ÕÑ¡•¹Ñ¥…Ñ•tô°…Íå¹Œ€¡É•ÅÕ•ÍÐ°É•Á±ä¤€ôøì(€€€½¹ÍÐÕÍ•È€ô•ÑÕÉÉ•¹ÑUÍ•È¡É•ÅÕ•ÍÐ°ÍÑ½É”°…ÕÑ ¤ì(€€€¥˜€¡ÕÍ•È¹É½±”€ôôô€…‘µ¥¸œ¤ì(€€€€€Ñ¡É½Ü¹•Ü½µ…¥¹ÉÉ½È UÍ”Ñ¡”…‘µ¥¸ÕÍ•ÈÑ½½±ÌÑ¼ÍÑ…ÉÐ„ÍÕÁÁ½ÉÐ½¹Ù•ÉÍ…Ñ¥½¸¸œ°€ÐÀÌ°€=I	%8œ¤ì(€€€ô(€€€½¹ÍÐ•á¥ÍÑ¥¹œ€ôl¸¸¹ÍÑ½É”¹½¹Ù•ÉÍ…Ñ¥½¹Ì¹Ù…±Õ•Ì ¥t¹™¥¹ (€€€€€€¡½¹Ù•ÉÍ…Ñ¥½¸¤€ôø(€€€€€€€½¹Ù•ÉÍ…Ñ¥½¸¹­¥¹€ôôô€…‘µ¥¸œ€˜˜½¹Ù•ÉÍ…Ñ¥½¸¹Á…ÉÑ¥¥Á…¹Ñ%‘Ì¹¥¹±Õ‘•Ì¡ÕÍ•È¹¥¤°(€€€€¤ì(€€€½¹ÍÐ½¹Ù•ÉÍ…Ñ¥½¸€ô•á¥ÍÑ¥¹œ€üü•Ñ=ÉÉ•…Ñ•‘µ¥¹½¹Ù•ÉÍ…Ñ¥½¸¡ÍÑ½É”°ÕÍ•È¹¥¤ì(€€€É•ÑÕÉ¸É•Á±ä¹½‘”¡•á¥ÍÑ¥¹œ€ü€ÈÀÀ€è€ÈÀÄ¤¹Í•¹¡ì½¹Ù•ÉÍ…Ñ¥½¸ô¤ì(€ô¤ì((€…ÁÀ¹•Ð œ½½¹Ù•ÉÍ…Ñ¥½¹Ì¼é¥½µ•ÍÍ…•Ìœ°ì½¹I•ÅÕ•ÍÐèm…ÁÀ¹…ÕÑ¡•¹Ñ¥…Ñ•tô°…Íå¹Œ€¡É•ÅÕ•ÍÐ¤€ôøì(€€€½¹ÍÐÕÍ•È€ô•ÑÕÉÉ•¹ÑUÍ•È¡É•ÅÕ•ÍÐ°ÍÑ½É”°…ÕÑ ¤ì(€€€½¹ÍÐì¥ô€ôÉ•ÅÕ•ÍÐ¹Á…É…µÌ…Ìì¥èÍÑÉ¥¹œôì(€€€½¹ÍÐ½¹Ù•ÉÍ…Ñ¥½¸€ôÉ•ÅÕ¥É•Y…±Õ”¡ÍÑ½É”¹½¹Ù•ÉÍ…Ñ¥½¹Ì¹•Ð¡¥¤°€½¹Ù•ÉÍ…Ñ¥½¸¹½Ð™½Õ¹¸œ¤ì(€€€¥˜€¡ÕÍ•È¹É½±”€„ôô€…‘µ¥¸œ€˜˜€…½¹Ù•ÉÍ…Ñ¥½¸¹Á…ÉÑ¥¥Á…¹Ñ%‘Ì¹¥¹±Õ‘•Ì¡ÕÍ•È¹¥¤¤ì(€€€€€Ñ¡É½Ü¹•Ü½µ…¥¹ÉÉ½È e½Ô…É”¹½ÐÁ…ÉÐ½˜Ñ¡¥Ì½¹Ù•ÉÍ…Ñ¥½¸¸œ°€ÐÀÌ°€=I	%8œ¤ì(€€€ô(€€€É•ÑÕÉ¸ìµ•ÍÍ…•ÌèÍÑ½É”¹µ•ÍÍ…•Ì¹™¥±Ñ•È ¡µ•ÍÍ…”¤€ôøµ•ÍÍ…”¹½¹Ù•ÉÍ…Ñ¥½¹%€ôôô¥¤ôì(€ô¤ì((€…ÁÀ¹Á½ÍÐ (€€€€œ½½¹Ù•ÉÍ…Ñ¥½¹Ì¼é¥½µ•ÍÍ…•Ìœ°(€€€ì½¹I•ÅÕ•ÍÐèm…ÁÀ¹…ÕÑ¡•¹Ñ¥…Ñ•tô°(€€€…Íå¹Œ€¡É•ÅÕ•ÍÐ°É•Á±ä¤€ôøì(€€€€€½¹ÍÐÕÍ•È€ô•ÑÕÉÉ•¹ÑUÍ•È¡É•ÅÕ•ÍÐ°ÍÑ½É”°…ÕÑ ¤ì(€€€€€½¹ÍÐì¥ô€ôÉ•ÅÕ•ÍÐ¹Á…É…µÌ…Ìì¥èÍÑÉ¥¹œôì(€€€€€½¹ÍÐ½¹Ù•ÉÍ…Ñ¥½¸€ôÉ•ÅÕ¥É•Y…±Õ”¡ÍÑ½É”¹½¹Ù•ÉÍ…Ñ¥½¹Ì¹•Ð¡¥¤°€½¹Ù•ÉÍ…Ñ¥½¸¹½Ð™½Õ¹¸œ¤ì(€€€€€¥˜€¡ÕÍ•È¹É½±”€„ôô€…‘µ¥¸œ€˜˜€…½¹Ù•ÉÍ…Ñ¥½¸¹Á…ÉÑ¥¥Á…¹Ñ%‘Ì¹¥¹±Õ‘•Ì¡ÕÍ•È¹¥¤¤ì(€€€€€€€Ñ¡É½Ü¹•Ü½µ…¥¹ÉÉ½È e½Ô…É”¹½ÐÁ…ÉÐ½˜Ñ¡¥Ì½¹Ù•ÉÍ…Ñ¥½¸¸œ°€ÐÀÌ°€=I	%8œ¤ì(€€€€€ô(€€€€€¥˜€¡ÕÍ•È¹É½±”€ôôô€…‘µ¥¸œ¤ì(€€€€€€€…Ý…¥ÐÉ•ÅÕ¥É•‘µ¥¹ÍÉ˜¡É•ÅÕ•ÍÐ¤ì(€€€€€ô(€€€€€½¹ÍÐìÑ•áÐ°…ÑÑ…¡µ•¹ÑÌô€ôÁ…ÉÍ•	½‘ä¡É•ÅÕ•ÍÐ°µ•ÍÍ…•M¡•µ„¤ì(€€€€€¥˜€¡½¹Ù•ÉÍ…Ñ¥½¸¹­¥¹€ôôô€…‘µ¥¸œ€˜˜ÕÍ•È¹É½±”€ôôô€…‘µ¥¸œ¤ì(€€€€€€€¥˜€ …½¹Ù•ÉÍ…Ñ¥½¸¹Á…ÉÑ¥¥Á…¹Ñ%‘Ì¹¥¹±Õ‘•Ì¡ÕÍ•È¹¥¤¤ì(€€€€€€€€€½¹Ù•ÉÍ…Ñ¥½¸¹Á…ÉÑ¥¥Á…¹Ñ%‘Ì¹ÁÕÍ ¡ÕÍ•È¹¥¤ì(€€€€€€€ô(€€€€€ô(€€€€€½¹ÍÐµ•ÍÍ…”€ôÉ•…Ñ•5•ÍÍ…”¡ÍÑ½É”°½¹Ù•ÉÍ…Ñ¥½¸°ÕÍ•È°Ñ•áÐ°…ÑÑ…¡µ•¹ÑÌ¤ì(€€€€€É•ÑÕÉ¸É•Á±ä¹½‘” ÈÀÄ¤¹Í•¹¡ìµ•ÍÍ…”ô¤ì(€€€ô°(€€¤ì((€…ÁÀ¹•Ð œ½¹½Ñ¥™¥…Ñ¥½¹Ìœ°ì½¹I•ÅÕ•ÍÐèm…ÁÀ¹…ÕÑ¡•¹Ñ¥…Ñ•tô°…Íå¹Œ€¡É•ÅÕ•ÍÐ¤€ôøì(€€€½¹ÍÐÕÍ•È€ô•ÑÕÉÉ•¹ÑUÍ•È¡É•ÅÕ•ÍÐ°ÍÑ½É”°…ÕÑ ¤ì(€€€É•ÑÕÉ¸ì¹½Ñ¥™¥…Ñ¥½¹ÌèÍÑ½É”¹¹½Ñ¥™¥…Ñ¥½¹Ì¹™¥±Ñ•È ¡¥Ñ•´¤€ôø¥Ñ•´¹ÕÍ•É%€ôôôÕÍ•È¹¥¤ôì(€ô¤ì((€…ÁÀ¹Á½ÍÐ œ½¹½Ñ¥™¥…Ñ¥½¹Ì¼é¥½É•…œ°ì½¹I•ÅÕ•ÍÐèm…ÁÀ¹…ÕÑ¡•¹Ñ¥…Ñ•tô°…Íå¹Œ€¡É•ÅÕ•ÍÐ¤€ôøì(€€€½¹ÍÐÕÍ•È€ô•ÑÕÉÉ•¹ÑUÍ•È¡É•ÅÕ•ÍÐ°ÍÑ½É”°…ÕÑ ¤ì(€€€½¹ÍÐì¥ô€ôÉ•ÅÕ•ÍÐ¹Á…É…µÌ…Ìì¥èÍÑÉ¥¹œôì(€€€½¹ÍÐ¹½Ñ¥™¥…Ñ¥½¸€ôÉ•ÅÕ¥É•Y…±Õ” (€€€€€ÍÑ½É”¹¹½Ñ¥™¥…Ñ¥½¹Ì¹™¥¹ ¡¥Ñ•´¤€ôø¥Ñ•´¹¥€ôôô¥€˜˜¥Ñ•´¹ÕÍ•É%€ôôôÕÍ•È¹¥¤°(€€€€€€9½Ñ¥™¥…Ñ¥½¸¹½Ð™½Õ¹¸œ°(€€€€¤ì(€€€¹½Ñ¥™¥…Ñ¥½¸¹É•…€ôÑÉÕ”ì(€€€É•ÑÕÉ¸ì¹½Ñ¥™¥…Ñ¥½¸ôì(€ô¤ì((€…ÁÀ¹Á½ÍÐ œ½Ý…É¹¥¹Ì¼é¥½É•…œ°ì½¹I•ÅÕ•ÍÐèm…ÁÀ¹…ÕÑ¡•¹Ñ¥…Ñ•tô°…Íå¹Œ€¡É•ÅÕ•ÍÐ¤€ôøì(€€€½¹ÍÐÕÍ•È€ô•ÑÕÉÉ•¹ÑUÍ•È¡É•ÅÕ•ÍÐ°ÍÑ½É”°…ÕÑ ¤ì(€€€½¹ÍÐì¥ô€ôÉ•ÅÕ•ÍÐ¹Á…É…µÌ…Ìì¥èÍÑÉ¥¹œôì(€€€½¹ÍÐÝ…É¹¥¹œ€ôÉ•ÅÕ¥É•Y…±Õ” (€€€€€ÍÑ½É”¹Ý…É¹¥¹Ì¹™¥¹ ¡¥Ñ•´¤€ôø¥Ñ•´¹¥€ôôô¥€˜˜¥Ñ•´¹ÕÍ•É%€ôôôÕÍ•È¹¥¤°(€€€€€€]…É¹¥¹œ¹½Ð™½Õ¹¸œ°(€€€€¤ì(€€€Ý…É¹¥¹œ¹É•…€ôÑÉÕ”ì(€€€É•ÑÕÉ¸ìÝ…É¹¥¹œôì(€ô¤ì((€…ÁÀ¹Á½ÍÐ (€€€€œ½ÕÁ±½…‘Ì½Í±½Ðœ°(€€€ì(€€€€€½¹I•ÅÕ•ÍÐèm…ÁÀ¹…ÕÑ¡•¹Ñ¥…Ñ•t°(€€€€€½¹™¥œèìÉ…Ñ•1¥µ¥Ðèìµ…àè€ÈÀ°Ñ¥µ•]¥¹‘½Üè€œÄ¡½ÕÈœôô°(€€€ô°(€€€…Íå¹Œ€¡É•ÅÕ•ÍÐ¤€ôøì(€€€€€½¹ÍÐÕÍ•È€ô•ÑÕÉÉ•¹ÑUÍ•È¡É•ÅÕ•ÍÐ°ÍÑ½É”°…ÕÑ ¤ì(€€€€€½¹ÍÐì™¥±•9…µ”°½¹Ñ•¹ÑQåÁ”°Í¥é”°…Ñ•½Éäô€ôÁ…ÉÍ•	½‘ä (€€€€€€€É•ÅÕ•ÍÐ°(€€€€€€€è¹½‰©•Ð¡ì(€€€€€€€€€™¥±•9…µ”èè¹ÍÑÉ¥¹œ ¤¹ÑÉ¥´ ¤¹µ¥¸ Ä¤¹µ…à ÈÔÔ¤°(€€€€€€€€€½¹Ñ•¹ÑQåÁ”èè¹ÍÑÉ¥¹œ ¤¹ÑÉ¥´ ¤¹µ¥¸ Ä¤¹µ…à ÄÈÀ¤°(€€€€€€€€€Í¥é”èè¹¹Õµ‰•È ¤¹¥¹Ð ¤¹Á½Í¥Ñ¥Ù” ¤¹µ…à ÄÀÀ€¨€ÄÀÈÐ€¨€ÄÀÈÐ¤°(€€€€€€€€€…Ñ•½Éäèè¹•¹Õ´¡l¥µ…”œ°€Ù¥‘•¼œ°€‘½Õµ•¹Ðœ°€…Ù…Ñ…Èœ°€‰…¹¹•Èt¤°(€€€€€€€ô¤°(€€€€€€¤ì(€€€€€½¹ÍÐ…±±½Ý•€ô(€€€€€€€…Ñ•½Éä€ôôô€Ù¥‘•¼œ(€€€€€€€€€€üÙ¥‘•½QåÁ•Ì(€€€€€€€€€€è…Ñ•½Éä€ôôô€‘½Õµ•¹Ðœ(€€€€€€€€€€€€ü‘½Õµ•¹ÑQåÁ•Ì(€€€€€€€€€€€€è¥µ…•QåÁ•Ìì(€€€€€½¹ÍÐ±¥µ¥Ð€ô(€€€€€€€…Ñ•½Éä€ôôô€Ù¥‘•¼œ€ü€ÄÀÀ€¨€ÄÀÈÐ€¨€ÄÀÈÐ€è…Ñ•½Éä€ôôô€‘½Õµ•¹Ðœ€ü€ÈÔ€¨€ÄÀÈÐ€¨€ÄÀÈÐ€è€ÄÀ€¨€ÄÀÈÐ€¨€ÄÀÈÐì(€€€€€¥˜€ ……±±½Ý•¹¥¹±Õ‘•Ì¡½¹Ñ•¹ÑQåÁ”¤ñðÍ¥é”€ðô€ÀñðÍ¥é”€ø±¥µ¥Ð¤ì(€€€€€€€Ñ¡É½Ü¹•Ü½µ…¥¹ÉÉ½È Q¡¥Ì™¥±”ÑåÁ”½ÈÍ¥é”¥Ì¹½Ð…±±½Ý•¸œ¤ì(€€€€€ô(€€€€€½¹ÍÐÍ…™•9…µ”€ô™¥±•9…µ”¹É•Á±…” ½my„µéµhÀ´ä¹|µt½œ°€œ´œ¤ì(€€€€€½¹ÍÐ½‰©•Ñ-•ä€ô(€€€€€€€…Ñ•½Éä€ôôô€…Ù…Ñ…Èœñð…Ñ•½Éä€ôôô€‰…¹¹•Èœ(€€€€€€€€€€ü€‘í…Ñ•½ÉåõÌ¼‘íÕÍ•È¹¥‘ô¼‘íÉåÁÑ¼¹É…¹‘½µUU% ¥ô´‘íÍ…™•9…µ•õ€(€€€€€€€€€€èÕÁ±½…‘Ì¼‘íÕÍ•È¹¥‘ô¼‘íÉåÁÑ¼¹É…¹‘½µUU% ¥ô´‘íÍ…™•9…µ•õ€ì(€€€€€¥˜€ …µ•‘¥„¤ì(€€€€€€€Ñ¡É½Ü¹•Ü½µ…¥¹ÉÉ½È (€€€€€€€€€€5•‘¥„ÕÁ±½…‘Ì…É”¹½Ð½¹™¥ÕÉ•¥¸Ñ¡¥Ì•¹Ù¥É½¹µ•¹Ð¸œ°(€€€€€€€€€€ÔÀÌ°(€€€€€€€€€€5%}9=Q}=9%UIœ°(€€€€€€€€¤ì(€€€€€ô(€€€€€É•ÑÕÉ¸ìÍ±½Ðè…Ý…¥Ðµ•‘¥„¹É•…Ñ•UÁ±½…‘M±½Ð¡½‰©•Ñ-•ä°½¹Ñ•¹ÑQåÁ”¤ôì(€€€ô°(€€¤ì((€…ÁÀ¹•Ð œ½…‘µ¥¸½½Ù•ÉÙ¥•Üœ°ì½¹I•ÅÕ•ÍÐèm…ÁÀ¹…ÕÑ¡•¹Ñ¥…Ñ•tô°…Íå¹Œ€¡É•ÅÕ•ÍÐ¤€ôøì(€€€½¹ÍÐÕÍ•È€ô•ÑÕÉÉ•¹ÑUÍ•È¡É•ÅÕ•ÍÐ°ÍÑ½É”°…ÕÑ ¤ì(€€€…ÍÍ•ÉÑ‘µ¥¸¡ÕÍ•È¤ì(€€€É•ÑÕÉ¸ì(€€€€€½Õ¹ÑÌèì(€€€€€€€ÕÍ•ÉÌèÍÑ½É”¹ÕÍ•ÉÌ¹Í¥é”°(€€€€€€€…Ñ¥Ù•½µµ¥ÍÍ¥½¹Ìèl¸¸¹ÍÑ½É”¹½µµ¥ÍÍ¥½¹Ì¹Ù…±Õ•Ì ¥t¹™¥±Ñ•È ¡½µµ¥ÍÍ¥½¸¤€ôø(€€€€€€€€€…Ñ¥Ù•MÑ…ÑÕÍ•Ì¹¥¹±Õ‘•Ì¡½µµ¥ÍÍ¥½¸¹ÍÑ…ÑÕÌ¤°(€€€€€€€€¤¹±•¹Ñ °(€€€€€€€½Á•¹¥ÍÁÕÑ•Ìèl¸¸¹ÍÑ½É”¹‘¥ÍÁÕÑ•Ì¹Ù…±Õ•Ì ¥t¹™¥±Ñ•È ¡‘¥ÍÁÕÑ”¤€ôø(€€€€€€€€€l½Á•¸œ°€Õ¹‘•É}É•Ù¥•Üt¹¥¹±Õ‘•Ì¡‘¥ÍÁÕÑ”¹ÍÑ…ÑÕÌ¤°(€€€€€€€€¤¹±•¹Ñ °(€€€€€€€Õ¹É•…‘‘µ¥¹¡…ÑÌèl¸¸¹ÍÑ½É”¹½¹Ù•ÉÍ…Ñ¥½¹Ì¹Ù…±Õ•Ì ¥t¹™¥±Ñ•È ¡½¹Ù•ÉÍ…Ñ¥½¸¤€ôøì(€€€€€€€€€¥˜€¡½¹Ù•ÉÍ…Ñ¥½¸¹­¥¹€„ôô€…‘µ¥¸œ¤É•ÑÕÉ¸™…±Í”ì(€€€€€€€€€½¹ÍÐ±…ÍÑ5•ÍÍ…”€ôÍÑ½É”¹µ•ÍÍ…•Ì(€€€€€€€€€€€€¹™¥±Ñ•È ¡µ•ÍÍ…”¤€ôøµ•ÍÍ…”¹½¹Ù•ÉÍ…Ñ¥½¹%€ôôô½¹Ù•ÉÍ…Ñ¥½¸¹¥¤(€€€€€€€€€€€€¹…Ð ´Ä¤ì(€€€€€€€€€É•ÑÕÉ¸	½½±•…¸ (€€€€€€€€€€€±…ÍÑ5•ÍÍ…”€˜˜(€€€€€€€€€€€€€ÍÑ½É”¹ÕÍ•ÉÌ¹•Ð¡±…ÍÑ5•ÍÍ…”¹Í•¹‘•É%¤ü¹É½±”€„ôô€…‘µ¥¸œ°(€€€€€€€€€€¤ì(€€€€€€€ô¤¹±•¹Ñ °(€€€€€ô°(€€€€€É••¹Ñ½µµ¥ÍÍ¥½¹Ìèl¸¸¹ÍÑ½É”¹½µµ¥ÍÍ¥½¹Ì¹Ù…±Õ•Ì ¥t¹Í±¥” ´Ô¤¹É•Ù•ÉÍ” ¤°(€€€€€É••¹Ñ¥ÍÁÕÑ•Ìèl¸¸¹ÍÑ½É”¹‘¥ÍÁÕÑ•Ì¹Ù…±Õ•Ì ¥t¹Í±¥” ´Ô¤¹É•Ù•ÉÍ” ¤°(€€€ôì(€ô¤ì((€…ÁÀ¹•Ð œ½…‘µ¥¸½ÍÉ˜œ°ì½¹I•ÅÕ•ÍÐèm…ÁÀ¹…ÕÑ¡•¹Ñ¥…Ñ•tô°…Íå¹Œ€¡É•ÅÕ•ÍÐ¤€ôøì(€€€½¹ÍÐ…‘µ¥¸€ô•ÑÕÉÉ•¹ÑUÍ•È¡É•ÅÕ•ÍÐ°ÍÑ½É”°…ÕÑ ¤ì(€€€…ÍÍ•ÉÑ‘µ¥¸¡…‘µ¥¸¤ì(€€€É•ÑÕÉ¸ì(€€€€€ÍÉ™Q½­•¸è…ÁÀ¹©ÝÐ¹Í¥¸ (€€€€€€€ìÍÕˆè…‘µ¥¸¹¥°É½±”è…‘µ¥¸¹É½±”°Í½Á”è€ÍÉ˜œô°(€€€€€€€ì•áÁ¥É•Í%¸è€œÄÁ´œô°(€€€€€€¤°(€€€€€•áÁ¥É•Í%¹M•½¹‘Ìè€ØÀÀ°(€€€ôì(€ô¤ì((€…ÁÀ¹•Ð œ½…‘µ¥¸½ÕÍ•ÉÌœ°ì½¹I•ÅÕ•ÍÐèm…ÁÀ¹…ÕÑ¡•¹Ñ¥…Ñ•tô°…Íå¹Œ€¡É•ÅÕ•ÍÐ¤€ôøì(€€€½¹ÍÐ…‘µ¥¸€ô•ÑÕÉÉ•¹ÑUÍ•È¡É•ÅÕ•ÍÐ°ÍÑ½É”°…ÕÑ ¤ì(€€€…ÍÍ•ÉÑ‘µ¥¸¡…‘µ¥¸¤ì(€€€½¹ÍÐÅÕ•Éä€ôÉ•ÅÕ•ÍÐ¹ÅÕ•Éä…ÌìÍ•…É üèÍÑÉ¥¹œìÍÑ…ÑÕÌüèUÍ•ÉlÍÑ…ÑÕÌtôì(€€€½¹ÍÐÍ•…É €ôÅÕ•Éä¹Í•…É ü¹Ñ½1½Ý•É…Í” ¤€üü€œœì(€€€É•ÑÕÉ¸ì(€€€€€ÕÍ•ÉÌèl¸¸¹ÍÑ½É”¹ÕÍ•ÉÌ¹Ù…±Õ•Ì ¥t(€€€€€€€€¹™¥±Ñ•È (€€€€€€€€€€¡ÕÍ•È¤€ôø(€€€€€€€€€€€€ …ÅÕ•Éä¹ÍÑ…ÑÕÌñðÕÍ•È¹ÍÑ…ÑÕÌ€ôôôÅÕ•Éä¹ÍÑ…ÑÕÌ¤€˜˜(€€€€€€€€€€€€ …Í•…É ñð(€€€€€€€€€€€€€ÕÍ•È¹•µ…¥°¹¥¹±Õ‘•Ì¡Í•…É ¤ñð(€€€€€€€€€€€€€ÕÍ•È¹‘¥ÍÁ±…å9…µ”¹Ñ½1½Ý•É…Í” ¤¹¥¹±Õ‘•Ì¡Í•…É ¤¤°(€€€€€€€€¤(€€€€€€€€¹µ…À¡Ñ½AÕ‰±¥UÍ•È¤°(€€€ôì(€ô¤ì((€…ÁÀ¹Á½ÍÐ (€€€€œ½…‘µ¥¸½ÕÍ•ÉÌ¼é¥½Ý…É¸œ°(€€€ì½¹I•ÅÕ•ÍÐèm…ÁÀ¹…ÕÑ¡•¹Ñ¥…Ñ•t°ÁÉ•!…¹‘±•ÈèmÉ•ÅÕ¥É•‘µ¥¹ÍÉ™tô°(€€€…Íå¹Œ€¡É•ÅÕ•ÍÐ°É•Á±ä¤€ôøì(€€€½¹ÍÐ…‘µ¥¸€ô•ÑÕÉÉ•¹ÑUÍ•È¡É•ÅÕ•ÍÐ°ÍÑ½É”°…ÕÑ ¤ì(€€€…ÍÍ•ÉÑ‘µ¥¸¡…‘µ¥¸¤ì(€€€½¹ÍÐì¥ô€ôÉ•ÅÕ•ÍÐ¹Á…É…µÌ…Ìì¥èÍÑÉ¥¹œôì(€€€½¹ÍÐìµ•ÍÍ…”ô€ôÁ…ÉÍ•	½‘ä (€€€€€É•ÅÕ•ÍÐ°(€€€€€è¹½‰©•Ð¡ìµ•ÍÍ…”èè¹ÍÑÉ¥¹œ ¤¹ÑÉ¥´ ¤¹µ¥¸ Ä¤¹µ…à Õ|ÀÀÀ¤ô¤°(€€€€¤ì(€€€½¹ÍÐÑ…É•Ð€ôÉ•ÅÕ¥É•Y…±Õ”¡ÍÑ½É”¹ÕÍ•ÉÌ¹•Ð¡¥¤°€UÍ•È¹½Ð™½Õ¹¸œ¤ì(€€€¥˜€ …µ•ÍÍ…”¹ÑÉ¥´ ¤¤Ñ¡É½Ü¹•Ü½µ…¥¹ÉÉ½È ]…É¹¥¹œµ•ÍÍ…”¥ÌÉ•ÅÕ¥É•¸œ¤ì(€€€½¹ÍÐÝ…É¹¥¹œ€ôì(€€€€€¥èÉåÁÑ¼¹É…¹‘½µUU% ¤°(€€€€€ÕÍ•É%èÑ…É•Ð¹¥°(€€€€€…‘µ¥¹%è…‘µ¥¸¹¥°(€€€€€µ•ÍÍ…”èµ•ÍÍ…”¹ÑÉ¥´ ¤°(€€€€€É•…è™…±Í”°(€€€€€É•…Ñ•‘Ðè¹•Ü…Ñ” ¤¹Ñ½%M=MÑÉ¥¹œ ¤°(€€€ôì(€€€ÍÑ½É”¹Ý…É¹¥¹Ì¹ÁÕÍ ¡Ý…É¹¥¹œ¤ì(€€€ÍÑ½É”¹¹½Ñ¥™¥…Ñ¥½¹Ì¹ÁÕÍ ¡ì(€€€€€¥èÉåÁÑ¼¹É…¹‘½µUU% ¤°(€€€€€ÕÍ•É%èÑ…É•Ð¹¥°(€€€€€ÑåÁ”è€…‘µ¥¹}Ý…É¹¥¹œœ°(€€€€€Ñ¥Ñ±”è€5•ÍÍ…”™É½´IÕ™™°ÍÕÁÁ½ÉÐœ°(€€€€€‰½‘äèÝ…É¹¥¹œ¹µ•ÍÍ…”°(€€€€€É•…è™…±Í”°(€€€€€É•…Ñ•‘ÐèÝ…É¹¥¹œ¹É•…Ñ•‘Ð°(€€€ô¤ì(€€€É•…Ñ•5•ÍÍ…” (€€€€€ÍÑ½É”°(€€€€€•Ñ=ÉÉ•…Ñ•‘µ¥¹½¹Ù•ÉÍ…Ñ¥½¸¡ÍÑ½É”°Ñ…É•Ð¹¥°…‘µ¥¸¹¥¤°(€€€€€…‘µ¥¸°(€€€€€]…É¹¥¹œ™É½´IÕ™™°ÍÕÁÁ½ÉÐè€‘íÝ…É¹¥¹œ¹µ•ÍÍ…•õ€°(€€€€¤ì(€€€É•ÑÕÉ¸É•Á±ä¹½‘” ÈÀÄ¤¹Í•¹¡ìÝ…É¹¥¹œô¤ì(€€€ô°(€€¤ì((€…ÁÀ¹Á½ÍÐ (€€€€œ½…‘µ¥¸½ÕÍ•ÉÌ¼é¥½ÍÕÍÁ•¹œ°(€€€ì½¹I•ÅÕ•ÍÐèm…ÁÀ¹…ÕÑ¡•¹Ñ¥…Ñ•t°ÁÉ•!…¹‘±•ÈèmÉ•ÅÕ¥É•‘µ¥¹ÍÉ™tô°(€€€…Íå¹Œ€¡É•ÅÕ•ÍÐ¤€ôøì(€€€½¹ÍÐ…‘µ¥¸€ô•ÑÕÉÉ•¹ÑUÍ•È¡É•ÅÕ•ÍÐ°ÍÑ½É”°…ÕÑ ¤ì(€€€…ÍÍ•ÉÑ‘µ¥¸¡…‘µ¥¸¤ì(€€€½¹ÍÐì¥ô€ôÉ•ÅÕ•ÍÐ¹Á…É…µÌ…Ìì¥èÍÑÉ¥¹œôì(€€€½¹ÍÐì¡½ÕÉÌ°É•…Í½¸ô€ôÁ…ÉÍ•	½‘ä (€€€€€É•ÅÕ•ÍÐ°(€€€€€è¹½‰©•Ð¡ì(€€€€€€€¡½ÕÉÌèè¹¹Õµ‰•È ¤¹™¥¹¥Ñ” ¤¹Á½Í¥Ñ¥Ù” ¤¹µ…à ÈÐ€¨€ÌØÔ¤°(€€€€€€€É•…Í½¸èè¹ÍÑÉ¥¹œ ¤¹ÑÉ¥´ ¤¹µ¥¸ Ä¤¹µ…à Õ|ÀÀÀ¤°(€€€€€ô¤°(€€€€¤ì(€€€½¹ÍÐÑ…É•Ð€ôÉ•ÅÕ¥É•Y…±Õ”¡ÍÑ½É”¹ÕÍ•ÉÌ¹•Ð¡¥¤°€UÍ•È¹½Ð™½Õ¹¸œ¤ì(€€€¥˜€¡Ñ…É•Ð¹É½±”€ôôô€…‘µ¥¸œñð¡½ÕÉÌ€ðô€Àñð€…É•…Í½¸¹ÑÉ¥´ ¤¤ì(€€€€€Ñ¡É½Ü¹•Ü½µ…¥¹ÉÉ½È ¹Ñ•È„Á½Í¥Ñ¥Ù”‘ÕÉ…Ñ¥½¸…¹É•…Í½¸™½È„¹½¸µ…‘µ¥¸ÕÍ•È¸œ¤ì(€€€ô(€€€Ñ…É•Ð¹ÍÑ…ÑÕÌ€ô€ÍÕÍÁ•¹‘•œì(€€€Ñ…É•Ð¹ÍÕÍÁ•¹‘•‘U¹Ñ¥°€ô¹•Ü…Ñ”¡…Ñ”¹¹½Ü ¤€¬¡½ÕÉÌ€¨€Í|ØÀÁ|ÀÀÀ¤¹Ñ½%M=MÑÉ¥¹œ ¤ì(€€€Ñ…É•Ð¹ÍÕÍÁ•¹Í¥½¹I•…Í½¸€ôÉ•…Í½¸¹ÑÉ¥´ ¤ì(€€€É•…Ñ•5•ÍÍ…” (€€€€€ÍÑ½É”°(€€€€€•Ñ=ÉÉ•…Ñ•‘µ¥¹½¹Ù•ÉÍ…Ñ¥½¸¡ÍÑ½É”°Ñ…É•Ð¹¥°…‘µ¥¸¹¥¤°(€€€€€…‘µ¥¸°(€€€€€e½ÕÈ…½Õ¹Ð¡…Ì‰••¸ÍÕÍÁ•¹‘•Õ¹Ñ¥°€‘íÑ…É•Ð¹ÍÕÍÁ•¹‘•‘U¹Ñ¥±ô¸I•…Í½¸è€‘íÑ…É•Ð¹ÍÕÍÁ•¹Í¥½¹I•…Í½¹õ€°(€€€€¤ì(€€€É•ÑÕÉ¸ìÕÍ•ÈèÑ½AÕ‰±¥UÍ•È¡Ñ…É•Ð¤ôì(€€€ô°(€€¤ì((€…ÁÀ¹Á½ÍÐ (€€€€œ½…‘µ¥¸½ÕÍ•ÉÌ¼é¥½Õ¹ÍÕÍÁ•¹œ°(€€€ì½¹I•ÅÕ•ÍÐèm…ÁÀ¹…ÕÑ¡•¹Ñ¥…Ñ•t°ÁÉ•!…¹‘±•ÈèmÉ•ÅÕ¥É•‘µ¥¹ÍÉ™tô°(€€€…Íå¹Œ€¡É•ÅÕ•ÍÐ¤€ôøì(€€€½¹ÍÐ…‘µ¥¸€ô•ÑÕÉÉ•¹ÑUÍ•È¡É•ÅÕ•ÍÐ°ÍÑ½É”°…ÕÑ ¤ì(€€€…ÍÍ•ÉÑ‘µ¥¸¡…‘µ¥¸¤ì(€€€½¹ÍÐì¥ô€ôÉ•ÅÕ•ÍÐ¹Á…É…µÌ…Ìì¥èÍÑÉ¥¹œôì(€€€½¹ÍÐÑ…É•Ð€ôÉ•ÅÕ¥É•Y…±Õ”¡ÍÑ½É”¹ÕÍ•ÉÌ¹•Ð¡¥¤°€UÍ•È¹½Ð™½Õ¹¸œ¤ì(€€€Ñ…É•Ð¹ÍÑ…ÑÕÌ€ô€…Ñ¥Ù”œì(€€€‘•±•Ñ”Ñ…É•Ð¹ÍÕÍÁ•¹‘•‘U¹Ñ¥°ì(€€€‘•±•Ñ”Ñ…É•Ð¹ÍÕÍÁ•¹Í¥½¹I•…Í½¸ì(€€€É•ÑÕÉ¸ìÕÍ•ÈèÑ½AÕ‰±¥UÍ•È¡Ñ…É•Ð¤ôì(€€€ô°(€€¤ì((€…ÁÀ¹‘•±•Ñ” (€€€€œ½…‘µ¥¸½ÕÍ•ÉÌ¼é¥œ°(€€€ì½¹I•ÅÕ•ÍÐèm…ÁÀ¹…ÕÑ¡•¹Ñ¥…Ñ•t°ÁÉ•!…¹‘±•ÈèmÉ•ÅÕ¥É•‘µ¥¹ÍÉ™tô°(€€€…Íå¹Œ€¡É•ÅÕ•ÍÐ¤€ôøì(€€€½¹ÍÐ…‘µ¥¸€ô•ÑÕÉÉ•¹ÑUÍ•È¡É•ÅÕ•ÍÐ°ÍÑ½É”°…ÕÑ ¤ì(€€€…ÍÍ•ÉÑ‘µ¥¸¡…‘µ¥¸¤ì(€€€½¹ÍÐì¥ô€ôÉ•ÅÕ•ÍÐ¹Á…É…µÌ…Ìì¥èÍÑÉ¥¹œôì(€€€½¹ÍÐ‰½‘ä€ôÁ…ÉÍ•Y…±Õ” (€€€€€É•ÅÕ•ÍÐ¹‰½‘ä€üüíô°(€€€€€è¹½‰©•Ð¡ìÁ•Éµ…¹•¹Ðèè¹‰½½±•…¸ ¤¹½ÁÑ¥½¹…° ¤ô¤°(€€€€¤ì(€€€½¹ÍÐÑ…É•Ð€ôÉ•ÅÕ¥É•Y…±Õ”¡ÍÑ½É”¹ÕÍ•ÉÌ¹•Ð¡¥¤°€UÍ•È¹½Ð™½Õ¹¸œ¤ì(€€€¥˜€¡Ñ…É•Ð¹É½±”€ôôô€…‘µ¥¸œ¤Ñ¡É½Ü¹•Ü½µ…¥¹ÉÉ½È ‘µ¥¸…½Õ¹ÑÌ…¹¹½Ð‰”É•µ½Ù•¡•É”¸œ¤ì(€€€¥˜€ …‰½‘ä¹Á•Éµ…¹•¹Ð¤ì(€€€€€Ñ…É•Ð¹ÍÑ…ÑÕÌ€ô€‘•±•Ñ•œì(€€€€€É•ÑÕÉ¸ì‘•±•Ñ•èÑÉÕ”°Á•Éµ…¹•¹Ðè™…±Í”ôì(€€€ô(€€€¥˜€¡Ñ…É•Ð¹ÍÑ…ÑÕÌ€„ôô€‘•±•Ñ•œ¤ì(€€€€€Ñ¡É½Ü¹•Ü½µ…¥¹ÉÉ½È M½™Ðµ‘•±•Ñ”Ñ¡”…½Õ¹Ð‰•™½É”Á•Éµ…¹•¹Ð‘•±•Ñ¥½¸¸œ¤ì(€€€ô(€€€Ñ…É•Ð¹•µ…¥°€ô‘•±•Ñ•¬‘íÑ…É•Ð¹¥‘õ‘•±•Ñ•¹¥¹Ù…±¥‘€ì(€€€Ñ…É•Ð¹Á…ÍÍÝ½É‘!…Í €ô…Ý…¥Ð¡…Í¡A…ÍÍÝ½É¡€‘íÉåÁÑ¼¹É…¹‘½µUU% ¥ô‘íÉåÁÑ¼¹É…¹‘½µUU% ¥õ€¤ì(€€€Ñ…É•Ð¹‘¥ÍÁ±…å9…µ”€ô€•±•Ñ•ÕÍ•Èœì(€€€‘•±•Ñ”Ñ…É•Ð¹…Ù…Ñ…ÉUÉ°ì(€€€‘•±•Ñ”Ñ…É•Ð¹‰¥¼ì(€€€‘•±•Ñ”Ñ…É•Ð¹ÁÕÍ¡Q½­•¸ì(€€€‘•±•Ñ”Ñ…É•Ð¹ÍÕÍÁ•¹‘•‘U¹Ñ¥°ì(€€€‘•±•Ñ”Ñ…É•Ð¹ÍÕÍÁ•¹Í¥½¹I•…Í½¸ì(€€€ÍÑ½É”¹µ…­•ÉAÉ½™¥±•Ì¹‘•±•Ñ”¡¥¤ì(€€€ÍÑ½É”¹Ý…¥Ñ±¥ÍÐ¹ÍÁ±¥” (€€€€€€À°(€€€€€ÍÑ½É”¹Ý…¥Ñ±¥ÍÐ¹±•¹Ñ °(€€€€€€¸¸¹ÍÑ½É”¹Ý…¥Ñ±¥ÍÐ¹™¥±Ñ•È (€€€€€€€€¡¥Ñ•´¤€ôø¥Ñ•´¹µ…­•É%€„ôô¥€˜˜¥Ñ•´¹½µµ¥ÍÍ¥½¹•É%€„ôô¥°(€€€€€€¤°(€€€€¤ì(€€€ÍÑ½É”¹Ý…É¹¥¹Ì¹ÍÁ±¥” (€€€€€€À°(€€€€€ÍÑ½É”¹Ý…É¹¥¹Ì¹±•¹Ñ °(€€€€€€¸¸¹ÍÑ½É”¹Ý…É¹¥¹Ì¹™¥±Ñ•È ¡¥Ñ•´¤€ôø¥Ñ•´¹ÕÍ•É%€„ôô¥€˜˜¥Ñ•´¹…‘µ¥¹%€„ôô¥¤°(€€€€¤ì(€€€ÍÑ½É”¹¹½Ñ¥™¥…Ñ¥½¹Ì¹ÍÁ±¥” (€€€€€€À°(€€€€€ÍÑ½É”¹¹½Ñ¥™¥…Ñ¥½¹Ì¹±•¹Ñ °(€€€€€€¸¸¹ÍÑ½É”¹¹½Ñ¥™¥…Ñ¥½¹Ì¹™¥±Ñ•È ¡¥Ñ•´¤€ôø¥Ñ•´¹ÕÍ•É%€„ôô¥¤°(€€€€¤ì(€€€É•ÑÕÉ¸ì‘•±•Ñ•èÑÉÕ”°Á•Éµ…¹•¹ÐèÑÉÕ”°…¹½¹åµ¥é•èÑÉÕ”ôì(€€€ô°(€€¤ì((€…ÁÀ¹•Ð œ½…‘µ¥¸½‘¥ÍÁÕÑ•Ìœ°ì½¹I•ÅÕ•ÍÐèm…ÁÀ¹…ÕÑ¡•¹Ñ¥…Ñ•tô°…Íå¹Œ€¡É•ÅÕ•ÍÐ¤€ôøì(€€€½¹ÍÐ…‘µ¥¸€ô•ÑÕÉÉ•¹ÑUÍ•È¡É•ÅÕ•ÍÐ°ÍÑ½É”°…ÕÑ ¤ì(€€€…ÍÍ•ÉÑ‘µ¥¸¡…‘µ¥¸¤ì(€€€É•ÑÕÉ¸ì(€€€€€‘¥ÍÁÕÑ•Ìèl¸¸¹ÍÑ½É”¹‘¥ÍÁÕÑ•Ì¹Ù…±Õ•Ì ¥t¹µ…À ¡‘¥ÍÁÕÑ”¤€ôø€¡ì(€€€€€€€€¸¸¹‘¥ÍÁÕÑ”°(€€€€€€€½µµ¥ÍÍ¥½¸èÍÑ½É”¹½µµ¥ÍÍ¥½¹Ì¹•Ð¡‘¥ÍÁÕÑ”¹½µµ¥ÍÍ¥½¹%¤°(€€€€€€€µ…Ñ•É¥…±ÌèÍÑ½É”¹µ…Ñ•É¥…±Ì¹™¥±Ñ•È ¡•¹ÑÉä¤€ôø•¹ÑÉä¹½µµ¥ÍÍ¥½¹%€ôôô‘¥ÍÁÕÑ”¹½µµ¥ÍÍ¥½¹%¤°(€€€€€ô¤¤°(€€€ôì(€ô¤ì((€…ÁÀ¹Á½ÍÐ (€€€€œ½…‘µ¥¸½ÕÍ•ÉÌ¼é¥½½¹Ù•ÉÍ…Ñ¥½¸œ°(€€€ì½¹I•ÅÕ•ÍÐèm…ÁÀ¹…ÕÑ¡•¹Ñ¥…Ñ•t°ÁÉ•!…¹‘±•ÈèmÉ•ÅÕ¥É•‘µ¥¹ÍÉ™tô°(€€€…Íå¹Œ€¡É•ÅÕ•ÍÐ¤€ôøì(€€€€€½¹ÍÐ…‘µ¥¸€ô•ÑÕÉÉ•¹ÑUÍ•È¡É•ÅÕ•ÍÐ°ÍÑ½É”°…ÕÑ ¤ì(€€€€€…ÍÍ•ÉÑ‘µ¥¸¡…‘µ¥¸¤ì(€€€€€½¹ÍÐì¥ô€ôÉ•ÅÕ•ÍÐ¹Á…É…µÌ…Ìì¥èÍÑÉ¥¹œôì(€€€€€½¹ÍÐÑ…É•Ð€ôÉ•ÅÕ¥É•Y…±Õ”¡ÍÑ½É”¹ÕÍ•ÉÌ¹•Ð¡¥¤°€UÍ•È¹½Ð™½Õ¹¸œ¤ì(€€€€€¥˜€¡Ñ…É•Ð¹É½±”€ôôô€…‘µ¥¸œ¤ì(€€€€€€€Ñ¡É½Ü¹•Ü½µ…¥¹ÉÉ½È ¡½½Í”„½µµ¥ÍÍ¥½¹•È½Èµ…­•È¸œ¤ì(€€€€€ô(€€€€€É•ÑÕÉ¸ì(€€€€€€€½¹Ù•ÉÍ…Ñ¥½¸è•Ñ=ÉÉ•…Ñ•‘µ¥¹½¹Ù•ÉÍ…Ñ¥½¸¡ÍÑ½É”°Ñ…É•Ð¹¥°…‘µ¥¸¹¥¤°(€€€€€ôì(€€€ô°(€€¤ì((€…ÁÀ¹Á½ÍÐ (€€€€œ½…‘µ¥¸½‘¥ÍÁÕÑ•Ì¼é¥½…ÍÍ¥¸œ°(€€€ì½¹I•ÅÕ•ÍÐèm…ÁÀ¹…ÕÑ¡•¹Ñ¥…Ñ•t°ÁÉ•!…¹‘±•ÈèmÉ•ÅÕ¥É•‘µ¥¹ÍÉ™tô°(€€€…Íå¹Œ€¡É•ÅÕ•ÍÐ¤€ôøì(€€€½¹ÍÐì¥ô€ôÉ•ÅÕ•ÍÐ¹Á…É…µÌ…Ìì¥èÍÑÉ¥¹œôì(€€€É•ÑÕÉ¸ì‘¥ÍÁÕÑ”è½µµ¥ÍÍ¥½¹Ì¹…ÍÍ¥¹¥ÍÁÕÑ”¡•ÑÕÉÉ•¹ÑUÍ•È¡É•ÅÕ•ÍÐ°ÍÑ½É”°…ÕÑ ¤°¥¤ôì(€€€ô°(€€¤ì((€…ÁÀ¹Á½ÍÐ (€€€€œ½…‘µ¥¸½‘¥ÍÁÕÑ•Ì¼é¥½É•Í½±Ù”œ°(€€€ì½¹I•ÅÕ•ÍÐèm…ÁÀ¹…ÕÑ¡•¹Ñ¥…Ñ•t°ÁÉ•!…¹‘±•ÈèmÉ•ÅÕ¥É•‘µ¥¹ÍÉ™tô°(€€€…Íå¹Œ€¡É•ÅÕ•ÍÐ¤€ôøì(€€€½¹ÍÐì¥ô€ôÉ•ÅÕ•ÍÐ¹Á…É…µÌ…Ìì¥èÍÑÉ¥¹œôì(€€€½¹ÍÐì½ÕÑ½µ”°É•Í½±ÕÑ¥½¸ô€ôÁ…ÉÍ•	½‘ä (€€€€€É•ÅÕ•ÍÐ°(€€€€€è¹½‰©•Ð¡ì(€€€€€€€½ÕÑ½µ”èè¹•¹Õ´¡l(€€€€€€€€€€µ…­•É}™…Ù½ÕÉ•œ°(€€€€€€€€€€½µµ¥ÍÍ¥½¹•É}™…Ù½ÕÉ•œ°(€€€€€€€€€€ÍÁ±¥Ñ}‘•¥Í¥½¸œ°(€€€€€€€€€€½µµ¥ÍÍ¥½¹}…¹•±±•œ°(€€€€€€€€€€¹½}É•Í½±ÕÑ¥½¸œ°(€€€€€€€t¤°(€€€€€€€É•Í½±ÕÑ¥½¸èè¹ÍÑÉ¥¹œ ¤¹ÑÉ¥´ ¤¹µ¥¸ Ä¤¹µ…à ÄÁ|ÀÀÀ¤°(€€€€€ô¤°(€€€€¤ì(€€€É•ÑÕÉ¸ì(€€€€€‘¥ÍÁÕÑ”è½µµ¥ÍÍ¥½¹Ì¹É•Í½±Ù•¥ÍÁÕÑ” (€€€€€€€•ÑÕÉÉ•¹ÑUÍ•È¡É•ÅÕ•ÍÐ°ÍÑ½É”°…ÕÑ ¤°(€€€€€€€¥°(€€€€€€€½ÕÑ½µ”°(€€€€€€€É•Í½±ÕÑ¥½¸°(€€€€€€¤°(€€€ôì(€€€ô°(€€¤ì((€…ÁÀ¹Á½ÍÐ (€€€€œ½…‘µ¥¸½‘¥ÍÁÕÑ•Ì¼é¥½±½Í”œ°(€€€ì½¹I•ÅÕ•ÍÐèm…ÁÀ¹…ÕÑ¡•¹Ñ¥…Ñ•t°ÁÉ•!…¹‘±•ÈèmÉ•ÅÕ¥É•‘µ¥¹ÍÉ™tô°(€€€…Íå¹Œ€¡É•ÅÕ•ÍÐ¤€ôøì(€€€½¹ÍÐì¥ô€ôÉ•ÅÕ•ÍÐ¹Á…É…µÌ…Ìì¥èÍÑÉ¥¹œôì(€€€É•ÑÕÉ¸ì‘¥ÍÁÕÑ”è½µµ¥ÍÍ¥½¹Ì¹±½Í•¥ÍÁÕÑ”¡•ÑÕÉÉ•¹ÑUÍ•È¡É•ÅÕ•ÍÐ°ÍÑ½É”°…ÕÑ ¤°¥¤ôì(€€€ô°(€€¤ì((€M•¹ÑÉä¹Í•ÑÕÁ…ÍÑ¥™åÉÉ½É!…¹‘±•È¡…ÁÀ¤ì(€…ÁÀ¹…‘‘!½½¬ ½¹±½Í”œ°…Íå¹Œ€ ¤€ôøì(€€€…Ý…¥ÐÍÑ½É”¹±½Í” ¤ì(€ô¤ì((€É•ÑÕÉ¸…ÁÀì)ô

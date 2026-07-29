@@ -128,4 +128,77 @@ describe('commission lifecycle', () => {
     });
     expect(response.statusCode).toBe(403);
   });
+
+  it('supports private direct and support conversations across accounts', async () => {
+    const direct = await app.inject({
+      method: 'POST',
+      url: '/conversations/direct',
+      headers: { authorization: `Bearer ${commissionerToken}` },
+      payload: { participantId: 'demo-maker' },
+    });
+    expect(direct.statusCode).toBe(201);
+    const directConversationId = direct.json().conversation.id as string;
+
+    const sent = await app.inject({
+      method: 'POST',
+      url: `/conversations/${directConversationId}/messages`,
+      headers: { authorization: `Bearer ${commissionerToken}` },
+      payload: { text: 'Could we discuss a future fox build?' },
+    });
+    expect(sent.statusCode).toBe(201);
+
+    const received = await app.inject({
+      method: 'GET',
+      url: `/conversations/${directConversationId}/messages`,
+      headers: { authorization: `Bearer ${makerToken}` },
+    });
+    expect(received.json().messages).toEqual([
+      expect.objectContaining({
+        text: 'Could we discuss a future fox build?',
+        senderId: 'demo-commissioner',
+      }),
+    ]);
+    const notificationResponse = await app.inject({
+      method: 'GET',
+      url: '/notifications',
+      headers: { authorization: `Bearer ${makerToken}` },
+    });
+    const messageNotification = notificationResponse
+      .json()
+      .notifications.find(
+        (notification: { type: string }) =>
+          notification.type === 'message_received',
+      );
+    const readNotification = await app.inject({
+      method: 'POST',
+      url: `/notifications/${messageNotification.id}/read`,
+      headers: { authorization: `Bearer ${makerToken}` },
+      payload: {},
+    });
+    expect(readNotification.json().notification.read).toBe(true);
+
+    const support = await app.inject({
+      method: 'POST',
+      url: '/support/conversation',
+      headers: { authorization: `Bearer ${commissionerToken}` },
+    });
+    expect(support.statusCode).toBe(201);
+    const supportConversationId = support.json().conversation.id as string;
+
+    await app.inject({
+      method: 'POST',
+      url: `/conversations/${supportConversationId}/messages`,
+      headers: { authorization: `Bearer ${commissionerToken}` },
+      payload: { text: 'I need help understanding a warning.' },
+    });
+
+    const makerInbox = await app.inject({
+      method: 'GET',
+      url: '/conversations',
+      headers: { authorization: `Bearer ${makerToken}` },
+    });
+    expect(makerInbox.json().conversations).not.toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: supportConversationId })]),
+    );
+  });
 });

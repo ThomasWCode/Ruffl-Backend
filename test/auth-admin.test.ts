@@ -31,6 +31,101 @@ describe('authentication and admin safety', () => {
     expect([...store.users.values()].some((user) => user.email === 'attacker@example.com')).toBe(false);
   });
 
+  it('returns a validation error instead of 500 for malformed login fields', async () => {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/auth/login',
+      payload: { email: 42, password: ['not', 'a', 'password'] },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().code).toBe('INVALID_REQUEST');
+  });
+
+  it('fails closed when production authentication configuration is unsafe', async () => {
+    await expect(
+      buildApp({
+        nodeEnv: 'production',
+        seedDemoData: false,
+        corsOrigins: ['https://admin.ruffl.thomaswhite.me'],
+      }),
+    ).rejects.toThrow('JWT_SECRET');
+
+    await expect(
+      buildApp({
+        nodeEnv: 'production',
+        jwtSecret: 'a-production-secret-that-is-long-enough',
+        seedDemoData: true,
+        corsOrigins: ['https://admin.ruffl.thomaswhite.me'],
+      }),
+    ).rejects.toThrow('SEED_DEMO_DATA');
+  });
+
+  it('does not expose maker emails or allow makers to self-grant trust badges', async () => {
+    const signup = await app.inject({
+      method: 'POST',
+      url: '/auth/signup',
+      payload: {
+        email: 'new-maker@example.com',
+        password: 'Password1!',
+        displayName: 'New Maker',
+        role: 'maker',
+      },
+    });
+    const { token, user } = signup.json() as { token: string; user: { id: string } };
+
+    const update = await app.inject({
+      method: 'PATCH',
+      url: '/maker-profile',
+      headers: { authorization: `Bearer ${token}` },
+      payload: {
+        bio: 'Updated profile',
+        verified: true,
+        trusted: true,
+      },
+    });
+    expect(update.statusCode).toBe(200);
+    expect(update.json().profile).toMatchObject({
+      bio: 'Updated profile',
+      verified: false,
+      trusted: false,
+    });
+
+    const publicMaker = await app.inject({
+      method: 'GET',
+      url: `/makers/${user.id}`,
+    });
+    expect(publicMaker.statusCode).toBe(200);
+    expect(publicMaker.json().user.email).toBeUndefined();
+  });
+
+  it('keeps another user admin support conversation private', async () => {
+    store.conversations.set('private-admin-chat', {
+      id: 'private-admin-chat',
+      kind: 'admin',
+      participantIds: ['demo-maker', 'demo-admin'],
+      createdAt: new Date().toISOString(),
+    });
+    const commissionerToken = (
+      await app.inject({
+        method: 'POST',
+        url: '/auth/login',
+        payload: { email: 'commissioner@demo.ruffl', password: 'RufflDemo1!' },
+      })
+    ).json().token;
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/conversations',
+      headers: { authorization: `Bearer ${commissionerToken}` },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().conversations).not.toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: 'private-admin-chat' })]),
+    );
+  });
+
   it('blocks every authenticated route immediately after suspension', async () => {
     const adminToken = (
       await app.inject({
@@ -149,6 +244,21 @@ describe('authentication and admin safety', () => {
         headers: { authorization: `Bearer ${adminToken}` },
       })
     ).json().csrfToken;
+    store.commissions.set('shared-record', {
+      id: 'shared-record',
+      commissionerId: 'demo-commissioner',
+      makerId: 'demo-maker',
+      title: 'Shared commission',
+      suitType: 'head',
+      species: 'Fox',
+      description: 'Retained for the other party.',
+      referenceNotes: '',
+      budget: 1000,
+      depositPaid: false,
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
 
     const deleted = await app.inject({
       method: 'DELETE',
@@ -178,6 +288,16 @@ describe('authentication and admin safety', () => {
       payload: { permanent: true },
     });
     expect(permanentlyDeleted.statusCode).toBe(200);
+    expect(permanentlyDeleted.json()).toMatchObject({
+      deleted: true,
+      permanent: true,
+      anonymized: true,
+    });
+    expect(store.users.get('demo-commissioner')).toMatchObject({
+      displayName: 'Deleted user',
+      status: 'deleted',
+    });
+    expect(store.commissions.has('shared-record')).toBe(true);
 
     const stillBlocked = await app.inject({
       method: 'GET',

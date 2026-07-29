@@ -14,6 +14,27 @@ import type {
   Warning,
 } from '../domain/types.js';
 
+export interface StoreSnapshot {
+  users: User[];
+  makerProfiles: MakerProfile[];
+  commissions: Commission[];
+  milestones: [string, Milestone[]][];
+  negotiations: NegotiationEntry[];
+  conversations: Conversation[];
+  messages: Message[];
+  reviews: Review[];
+  materials: MaterialEntry[];
+  waitlist: WaitlistEntry[];
+  disputes: Dispute[];
+  warnings: Warning[];
+  notifications: Notification[];
+}
+
+export interface StoreMutation {
+  commit: () => Promise<void>;
+  rollback: () => void;
+}
+
 export class InMemoryStore {
   readonly users = new Map<string, User>();
   readonly makerProfiles = new Map<string, MakerProfile>();
@@ -28,6 +49,8 @@ export class InMemoryStore {
   readonly disputes = new Map<string, Dispute>();
   readonly warnings: Warning[] = [];
   readonly notifications: Notification[] = [];
+  readonly persistent: boolean = false;
+  private mutationQueue = Promise.resolve();
 
   clear(): void {
     this.users.clear();
@@ -44,4 +67,90 @@ export class InMemoryStore {
     this.warnings.length = 0;
     this.notifications.length = 0;
   }
+
+  snapshot(): StoreSnapshot {
+    return structuredClone({
+      users: [...this.users.values()],
+      makerProfiles: [...this.makerProfiles.values()],
+      commissions: [...this.commissions.values()],
+      milestones: [...this.milestones.entries()],
+      negotiations: this.negotiations,
+      conversations: [...this.conversations.values()],
+      messages: this.messages,
+      reviews: this.reviews,
+      materials: this.materials,
+      waitlist: this.waitlist,
+      disputes: [...this.disputes.values()],
+      warnings: this.warnings,
+      notifications: this.notifications,
+    });
+  }
+
+  restore(snapshot: StoreSnapshot): void {
+    this.clear();
+    snapshot.users.forEach((item) => this.users.set(item.id, structuredClone(item)));
+    snapshot.makerProfiles.forEach((item) =>
+      this.makerProfiles.set(item.userId, structuredClone(item)),
+    );
+    snapshot.commissions.forEach((item) =>
+      this.commissions.set(item.id, structuredClone(item)),
+    );
+    snapshot.milestones.forEach(([commissionId, items]) =>
+      this.milestones.set(commissionId, structuredClone(items)),
+    );
+    this.negotiations.push(...structuredClone(snapshot.negotiations));
+    snapshot.conversations.forEach((item) =>
+      this.conversations.set(item.id, structuredClone(item)),
+    );
+    this.messages.push(...structuredClone(snapshot.messages));
+    this.reviews.push(...structuredClone(snapshot.reviews));
+    this.materials.push(...structuredClone(snapshot.materials));
+    this.waitlist.push(...structuredClone(snapshot.waitlist));
+    snapshot.disputes.forEach((item) => this.disputes.set(item.id, structuredClone(item)));
+    this.warnings.push(...structuredClone(snapshot.warnings));
+    this.notifications.push(...structuredClone(snapshot.notifications));
+  }
+
+  async beginMutation(): Promise<StoreMutation> {
+    let release = () => {};
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const previous = this.mutationQueue;
+    this.mutationQueue = previous.then(() => current);
+    await previous;
+
+    const before = this.snapshot();
+    let finished = false;
+    return {
+      commit: async () => {
+        if (finished) return;
+        finished = true;
+        const after = this.snapshot();
+        try {
+          await this.persistChanges(before, after);
+        } catch (error) {
+          this.restore(before);
+          throw error;
+        } finally {
+          release();
+        }
+      },
+      rollback: () => {
+        if (finished) return;
+        finished = true;
+        this.restore(before);
+        release();
+      },
+    };
+  }
+
+  async readinessCheck(): Promise<void> {}
+
+  async close(): Promise<void> {}
+
+  protected async persistChanges(
+    _before: StoreSnapshot,
+    _after: StoreSnapshot,
+  ): Promise<void> {}
 }

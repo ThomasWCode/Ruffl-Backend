@@ -20,6 +20,9 @@ export async function hashPassword(password: string): Promise<string> {
   if (password.length < 8) {
     throw new DomainError('Password must contain at least 8 characters.');
   }
+  if (password.length > 128) {
+    throw new DomainError('Password must contain no more than 128 characters.');
+  }
 
   const salt = randomBytes(16).toString('hex');
   const derivedKey = (await scrypt(password, salt, 64)) as Buffer;

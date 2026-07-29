@@ -1,12 +1,19 @@
 name: Deploy Backend
 
 on:
-  push:
+  workflow_run:
+    workflows:
+      - CI
+    types:
+      - completed
     branches:
       - main
 
 jobs:
   deploy:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push'
     runs-on: ubuntu-latest
 
     steps:
@@ -21,5 +28,5 @@ jobs:
           script: |
             cd ~/Ruffl-Backend
             git fetch origin
-            git reset --hard origin/main
+            git reset --hard ${{ github.event.workflow_run.head_sha }}
             docker compose up -d --build
