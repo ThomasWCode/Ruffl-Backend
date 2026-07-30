@@ -1,4 +1,5 @@
 import type {
+  AdminAuditEvent,
   Commission,
   Conversation,
   Dispute,
@@ -8,6 +9,7 @@ import type {
   Milestone,
   NegotiationEntry,
   Notification,
+  PushDelivery,
   Review,
   User,
   WaitlistEntry,
@@ -27,7 +29,9 @@ export interface StoreSnapshot {
   waitlist: WaitlistEntry[];
   disputes: Dispute[];
   warnings: Warning[];
+  adminAuditEvents: AdminAuditEvent[];
   notifications: Notification[];
+  pushDeliveries: PushDelivery[];
 }
 
 export interface StoreMutation {
@@ -48,7 +52,9 @@ export class InMemoryStore {
   readonly waitlist: WaitlistEntry[] = [];
   readonly disputes = new Map<string, Dispute>();
   readonly warnings: Warning[] = [];
+  readonly adminAuditEvents: AdminAuditEvent[] = [];
   readonly notifications: Notification[] = [];
+  readonly pushDeliveries = new Map<string, PushDelivery>();
   readonly persistent: boolean = false;
   private mutationQueue = Promise.resolve();
 
@@ -65,7 +71,9 @@ export class InMemoryStore {
     this.waitlist.length = 0;
     this.disputes.clear();
     this.warnings.length = 0;
+    this.adminAuditEvents.length = 0;
     this.notifications.length = 0;
+    this.pushDeliveries.clear();
   }
 
   snapshot(): StoreSnapshot {
@@ -82,7 +90,9 @@ export class InMemoryStore {
       waitlist: this.waitlist,
       disputes: [...this.disputes.values()],
       warnings: this.warnings,
+      adminAuditEvents: this.adminAuditEvents,
       notifications: this.notifications,
+      pushDeliveries: [...this.pushDeliveries.values()],
     });
   }
 
@@ -108,7 +118,11 @@ export class InMemoryStore {
     this.waitlist.push(...structuredClone(snapshot.waitlist));
     snapshot.disputes.forEach((item) => this.disputes.set(item.id, structuredClone(item)));
     this.warnings.push(...structuredClone(snapshot.warnings));
+    this.adminAuditEvents.push(...structuredClone(snapshot.adminAuditEvents));
     this.notifications.push(...structuredClone(snapshot.notifications));
+    snapshot.pushDeliveries.forEach((item) =>
+      this.pushDeliveries.set(item.id, structuredClone(item)),
+    );
   }
 
   async beginMutation(): Promise<StoreMutation> {

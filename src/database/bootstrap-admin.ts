@@ -36,8 +36,8 @@ try {
   const passwordHash = await hashPassword(password);
   const result = await pool.query<{ id: string; email: string }>(
     `insert into public.app_user (
-       email, password_hash, display_name, role, status
-     ) values ($1, $2, $3, 'admin', 'active')
+       email, password_hash, display_name, role, status, email_verified_at
+     ) values ($1, $2, $3, 'admin', 'active', now())
      on conflict (email) do update set
        password_hash = excluded.password_hash,
        display_name = excluded.display_name,
@@ -45,6 +45,7 @@ try {
        status = 'active',
        suspended_until = null,
        suspension_reason = null,
+       email_verified_at = now(),
        updated_at = now()
      returning id, email`,
     [email, passwordHash, displayName],

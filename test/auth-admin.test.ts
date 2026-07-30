@@ -42,6 +42,73 @@ describe('authentication and admin safety', () => {
     expect(response.json().code).toBe('INVALID_REQUEST');
   });
 
+  it('blocks self-deletion during active work and revokes the account after cancellation', async () => {
+    const signup = await app.inject({
+      method: 'POST',
+      url: '/auth/signup',
+      payload: {
+        email: 'delete-me@example.com',
+        password: 'Password1!',
+        displayName: 'Delete Me',
+        role: 'commissioner',
+      },
+    });
+    const { token, user } = signup.json() as {
+      token: string;
+      user: { id: string };
+    };
+    store.users.get(user.id)!.pushToken = 'ExponentPushToken[delete-me]';
+
+    const commission = await app.inject({
+      method: 'POST',
+      url: '/commissions',
+      headers: { authorization: `Bearer ${token}` },
+      payload: {
+        makerId: 'demo-maker',
+        title: 'Deletion safety commission',
+        suitType: 'head',
+        species: 'Fox',
+        description: 'A commission used to protect active work during account deletion.',
+        referenceNotes: '',
+        budget: 1_000,
+      },
+    });
+    expect(commission.statusCode).toBe(201);
+
+    const blocked = await app.inject({
+      method: 'DELETE',
+      url: '/me',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(blocked.statusCode).toBe(400);
+    expect(blocked.json().message).toContain('active commissions');
+
+    const cancelled = await app.inject({
+      method: 'POST',
+      url: `/commissions/${commission.json().commission.id}/cancel`,
+      headers: { authorization: `Bearer ${token}` },
+      payload: {},
+    });
+    expect(cancelled.statusCode).toBe(200);
+
+    const deleted = await app.inject({
+      method: 'DELETE',
+      url: '/me',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(deleted.statusCode).toBe(200);
+    expect(store.users.get(user.id)).toMatchObject({ status: 'deleted' });
+    expect(store.users.get(user.id)?.pushToken).toBeUndefined();
+
+    const revoked = await app.inject({
+      method: 'GET',
+      url: '/me',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(revoked.statusCode).toBe(403);
+    expect(revoked.json().code).toBe('ACCOUNT_DELETED');
+  });
+
   it('fails closed when production authentication configuration is unsafe', async () => {
     await expect(
       buildApp({
@@ -306,6 +373,23 @@ describe('authentication and admin safety', () => {
     });
     expect(stillBlocked.statusCode).toBe(403);
     expect(stillBlocked.json().code).toBe('ACCOUNT_DELETED');
+
+    const audit = await app.inject({
+      method: 'GET',
+      url: '/admin/audit',
+      headers: { authorization: `Bearer ${adminToken}` },
+    });
+    expect(audit.statusCode).toBe(200);
+    expect(audit.json().events).toEqual([
+      expect.objectContaining({
+        action: 'user_anonymized',
+        targetUserId: 'demo-commissioner',
+      }),
+      expect.objectContaining({
+        action: 'user_soft_deleted',
+        targetUserId: 'demo-commissioner',
+      }),
+    ]);
   });
 
   it('delivers new warnings through the live session endpoint and acknowledges them', async () => {

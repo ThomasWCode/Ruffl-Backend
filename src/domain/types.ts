@@ -33,6 +33,7 @@ export interface User {
   pushToken?: string;
   suspendedUntil?: string;
   suspensionReason?: string;
+  emailVerifiedAt?: string;
   createdAt: string;
 }
 
@@ -46,6 +47,7 @@ export interface PublicUser {
   bio?: string;
   suspendedUntil?: string;
   suspensionReason?: string;
+  emailVerifiedAt?: string;
   createdAt: string;
 }
 
@@ -112,6 +114,7 @@ export interface Commission {
   depositAmount?: number;
   depositPaid: boolean;
   status: CommissionStatus;
+  statusBeforeDispute?: Exclude<CommissionStatus, 'disputed'>;
   trackingNumber?: string;
   createdAt: string;
   updatedAt: string;
@@ -199,6 +202,15 @@ export interface Warning {
   createdAt: string;
 }
 
+export interface AdminAuditEvent {
+  id: string;
+  adminId: string;
+  targetUserId?: string;
+  action: string;
+  details: Record<string, string | number | boolean | null>;
+  createdAt: string;
+}
+
 export interface Notification {
   id: string;
   userId: string;
@@ -206,6 +218,21 @@ export interface Notification {
   title: string;
   body: string;
   read: boolean;
+  createdAt: string;
+}
+
+export type PushDeliveryStatus = 'queued' | 'sent' | 'delivered' | 'failed';
+
+export interface PushDelivery {
+  id: string;
+  notificationId: string;
+  userId: string;
+  pushToken: string;
+  status: PushDeliveryStatus;
+  receiptId?: string;
+  attempts: number;
+  nextAttemptAt: string;
+  lastError?: string;
   createdAt: string;
 }
 

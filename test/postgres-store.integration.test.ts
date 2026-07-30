@@ -3,6 +3,7 @@ import { beforeAll, describe, expect, it } from 'vitest';
 
 import { buildApp } from '../src/app.js';
 import { runMigrations } from '../src/database/migration-service.js';
+import { hashPassword } from '../src/services/auth-service.js';
 import { PostgresStore } from '../src/store/postgres-store.js';
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
@@ -33,6 +34,8 @@ describe.skipIf(!databaseUrl)('PostgresStore integration', () => {
       await runMigrations(databaseUrl!, undefined, 'ruffl_runtime');
       await pool.query(
         `truncate table
+           public.admin_audit_event,
+           public.push_delivery,
            public.notification,
            public.admin_warning,
            public.dispute_evidence,
@@ -50,6 +53,12 @@ describe.skipIf(!databaseUrl)('PostgresStore integration', () => {
            public.maker_profile,
            public.app_user
          restart identity cascade`,
+      );
+      await pool.query(
+        `insert into public.app_user (
+           email, password_hash, display_name, role, status, email_verified_at
+         ) values ($1, $2, 'Test Admin', 'admin', 'active', now())`,
+        ['admin@example.com', await hashPassword('AdminPassword1!')],
       );
     } finally {
       await pool.end();
@@ -107,6 +116,34 @@ describe.skipIf(!databaseUrl)('PostgresStore integration', () => {
       payload: { text: 'This survives a restart.' },
     });
     expect(messageResponse.statusCode).toBe(201);
+
+    const adminLogin = await firstApp.inject({
+      method: 'POST',
+      url: '/auth/login',
+      payload: {
+        email: 'admin@example.com',
+        password: 'AdminPassword1!',
+      },
+    });
+    expect(adminLogin.statusCode).toBe(200);
+    const adminToken = adminLogin.json().token as string;
+    const csrfToken = (
+      await firstApp.inject({
+        method: 'GET',
+        url: '/admin/csrf',
+        headers: { authorization: `Bearer ${adminToken}` },
+      })
+    ).json().csrfToken as string;
+    const warning = await firstApp.inject({
+      method: 'POST',
+      url: `/admin/users/${maker.user.id}/warn`,
+      headers: {
+        authorization: `Bearer ${adminToken}`,
+        'x-csrf-token': csrfToken,
+      },
+      payload: { message: 'Persistent audit test warning.' },
+    });
+    expect(warning.statusCode).toBe(201);
     await firstApp.close();
 
     const secondStore = await PostgresStore.connect(runtimeDatabaseUrl!);
@@ -134,6 +171,29 @@ describe.skipIf(!databaseUrl)('PostgresStore integration', () => {
       expect(messages.statusCode).toBe(200);
       expect(messages.json().messages).toEqual([
         expect.objectContaining({ text: 'This survives a restart.' }),
+      ]);
+
+      const secondAdminLogin = await secondApp.inject({
+        method: 'POST',
+        url: '/auth/login',
+        payload: {
+          email: 'admin@example.com',
+          password: 'AdminPassword1!',
+        },
+      });
+      const audit = await secondApp.inject({
+        method: 'GET',
+        url: '/admin/audit',
+        headers: {
+          authorization: `Bearer ${secondAdminLogin.json().token as string}`,
+        },
+      });
+      expect(audit.statusCode).toBe(200);
+      expect(audit.json().events).toEqual([
+        expect.objectContaining({
+          action: 'user_warned',
+          targetUserId: maker.user.id,
+        }),
       ]);
     } finally {
       await secondApp.close();

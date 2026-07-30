@@ -7,7 +7,7 @@
     "node": ">=20.19"
   },
   "scripts": {
-    "dev": "tsx watch src/server.ts",
+    "dev": "tsx watch --env-file=.env src/server.ts",
     "build": "tsc -p tsconfig.build.json",
     "db:migrate": "node dist/database/migrate.js",
     "db:bootstrap-admin": "node dist/database/bootstrap-admin.js",
@@ -21,6 +21,7 @@
     "@aws-sdk/client-s3": "^3.1098.0",
     "@aws-sdk/s3-request-presigner": "^3.1098.0",
     "@fastify/cors": "^11.1.0",
+    "@fastify/formbody": "^8.0.2",
     "@fastify/helmet": "^13.0.2",
     "@fastify/jwt": "^10.0.0",
     "@fastify/rate-limit": "^10.3.0",

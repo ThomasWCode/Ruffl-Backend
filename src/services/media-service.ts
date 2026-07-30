@@ -11,7 +11,20 @@ interface MediaConfiguration {
   publicUrl: string;
 }
 
-export class MediaService {
+export interface MediaGateway {
+  createUploadSlot(
+    objectKey: string,
+    contentType: string,
+    size: number,
+  ): Promise<UploadSlot>;
+  ownsPublicUrl(
+    url: string,
+    userId: string,
+    folder: 'uploads' | 'avatars' | 'banners',
+  ): boolean;
+}
+
+export class MediaService implements MediaGateway {
   private readonly client: S3Client;
 
   constructor(private readonly configuration: MediaConfiguration) {
@@ -49,6 +62,7 @@ export class MediaService {
   async createUploadSlot(
     objectKey: string,
     contentType: string,
+    size: number,
   ): Promise<UploadSlot> {
     const expiresInSeconds = 300;
     const uploadUrl = await getSignedUrl(
@@ -57,8 +71,12 @@ export class MediaService {
         Bucket: this.configuration.bucket,
         Key: objectKey,
         ContentType: contentType,
+        ContentLength: size,
       }),
-      { expiresIn: expiresInSeconds },
+      {
+        expiresIn: expiresInSeconds,
+        signableHeaders: new Set(['content-type']),
+      },
     );
     return {
       uploadUrl,
@@ -67,5 +85,24 @@ export class MediaService {
       method: 'PUT',
       headers: { 'Content-Type': contentType },
     };
+  }
+
+  ownsPublicUrl(
+    url: string,
+    userId: string,
+    folder: 'uploads' | 'avatars' | 'banners',
+  ): boolean {
+    const publicBase = new URL(
+      `${this.configuration.publicUrl.replace(/\/+$/, '')}/`,
+    );
+    const candidate = new URL(url);
+    const basePath = publicBase.pathname.replace(/\/+$/, '');
+    const ownedPath = `${basePath}/${folder}/${userId}/`;
+    return (
+      candidate.origin === publicBase.origin &&
+      candidate.pathname.startsWith(ownedPath) &&
+      !candidate.search &&
+      !candidate.hash
+    );
   }
 }

@@ -9,6 +9,13 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-production
+  cancel-in-progress: false
+
 jobs:
   deploy:
     if: >-
@@ -18,7 +25,7 @@ jobs:
 
     steps:
       - name: Deploy over SSH
-        uses: appleboy/ssh-action@v1.2.2
+        uses: appleboy/ssh-action@2ead5e36573f08b82fbfce1504f1a4b05a647c6f # v1.2.2
 
         with:
           host: ${{ secrets.HOST }}
@@ -26,7 +33,14 @@ jobs:
           key: ${{ secrets.SSH_PRIVATE_KEY }}
 
           script: |
+            set -eu
             cd ~/Ruffl-Backend
             git fetch origin
             git reset --hard ${{ github.event.workflow_run.head_sha }}
-            docker compose up -d --build
+            docker compose build api
+            if ! docker compose up -d --wait --wait-timeout 180 api; then
+              docker compose ps
+              docker compose logs --tail=100 api
+              exit 1
+            fi
+            docker compose ps

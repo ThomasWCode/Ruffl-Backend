@@ -6,6 +6,7 @@ import type { PublicUser, User, UserRole } from '../domain/types.js';
 import type { InMemoryStore } from '../store/in-memory-store.js';
 
 const scrypt = promisify(scryptCallback);
+const dummyPasswordHash = `${'0'.repeat(32)}:${'0'.repeat(128)}`;
 
 export function toPublicUser(user: User): PublicUser {
   const {
@@ -31,7 +32,12 @@ export async function hashPassword(password: string): Promise<string> {
 
 export async function verifyPassword(password: string, storedHash: string): Promise<boolean> {
   const [salt, key] = storedHash.split(':');
-  if (!salt || !key) {
+  if (
+    !salt ||
+    !key ||
+    !/^[0-9a-f]{32}$/i.test(salt) ||
+    !/^[0-9a-f]{128}$/i.test(key)
+  ) {
     return false;
   }
 
@@ -96,13 +102,24 @@ export class AuthService {
   async login(emailInput: string, password: string): Promise<User> {
     const email = emailInput.trim().toLowerCase();
     const user = [...this.store.users.values()].find((candidate) => candidate.email === email);
-    if (!user || !(await verifyPassword(password, user.passwordHash))) {
+    const passwordMatches = await verifyPassword(
+      password,
+      user?.passwordHash ?? dummyPasswordHash,
+    );
+    if (!user || !passwordMatches) {
       throw new DomainError('Email or password is incorrect.', 401, 'INVALID_CREDENTIALS');
     }
     if (user.status === 'deleted') {
       throw new DomainError('This account has been deleted.', 403, 'ACCOUNT_DELETED');
     }
     this.ensureActive(user);
+    if (!user.emailVerifiedAt) {
+      throw new DomainError(
+        'Verify your email before signing in.',
+        403,
+        'EMAIL_NOT_VERIFIED',
+      );
+    }
     return user;
   }
 

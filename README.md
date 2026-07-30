@@ -20,21 +20,27 @@ You do not need prior backend experience to run the development version. Follow 
 
 ## What is implemented
 
-- Email/password signup and login with 30-day bearer tokens
+- Email/password signup, verified-email activation, password recovery, and 30-day bearer tokens
 - Commissioner/maker-only public signup; admin signup is rejected
 - Live suspension/deletion checks on every authenticated request
+- User-initiated deletion with active-commission protection, push-token removal, and immediate session revocation
 - Maker profiles, discovery, open-queue filtering, and waitlists
 - Request to negotiation to simulated deposit to milestones to shipping to receipt lifecycle
+- Party cancellation before a recorded deposit; later cancellation requires a dispute and human adjudication
 - Unified conversation/message model for commission, direct, dispute, and admin chat
 - Five-category reviews, maker materials tracking, warnings, and notifications
 - Disputes with evidence, assignment, adjudication, and closure
+- Repeat dispute history for later independent issues, with the newest case shown on the commission
 - Admin user moderation and read-only marketplace context
+- Append-only PostgreSQL audit events for high-impact moderation and dispute actions
 - Ten-minute CSRF tokens for browser-based admin mutations
-- Upload-slot type/size validation and stable avatar/banner object keys
+- Upload-slot type/size validation, account-owned attachment URLs, and stable avatar/banner object keys
 - PostgreSQL migrations, a persistent store, request-level commit/rollback, and readiness checks
 - Real Cloudflare R2 upload signing; development returns a clear 503 when R2 is not configured
+- Resend transactional delivery for one-use email-verification and password-reset links
 - Sentry error reporting with environment, release, and trace sampling controls
 - Schema validation for authentication, profiles, commissions, messages, uploads, and admin actions
+- Scrypt password hashing, timing-balanced unknown-account login checks, and strict stored-hash validation
 - A database trigger that rejects admin-role creation or promotion unless a privileged session explicitly opts in
 
 ## Project structure
@@ -96,7 +102,7 @@ Open `.env` and replace the `JWT_SECRET` example value with the generated value.
 
 ## 3. Understand the environment settings
 
-The development defaults in `.env.example` are enough to run the current in-memory version after replacing `JWT_SECRET`.
+The development defaults in `.env.example` are enough to run the current in-memory version after replacing `JWT_SECRET`. Integration values such as `DATABASE_URL`, `R2_BUCKET`, `R2_PUBLIC_URL`, and `EMAIL_FROM` are deliberately blank locally; filling only part of an integration configuration is treated as an error instead of silently using a fake service.
 
 | Setting | Purpose |
 |---|---|
@@ -104,6 +110,7 @@ The development defaults in `.env.example` are enough to run the current in-memo
 | `HOST` | `0.0.0.0` lets both this computer and devices on the local network reach the API. |
 | `NODE_ENV` | Use `development` locally and `production` on a deployed server. |
 | `JWT_SECRET` | Private key used to sign login tokens. Use a long random value and never publish it. |
+| `BACKEND_PUBLIC_URL` | Exact public origin used in secure account links. Use `http://localhost:3000` locally and the HTTPS backend origin in production. |
 | `CORS_ORIGINS` | Comma-separated browser origins allowed to call the API. |
 | `SEED_DEMO_DATA` | Creates the demo users when `true`. This must be `false` in production. |
 | `DATABASE_URL` | Normal application PostgreSQL connection. It is required in production. |
@@ -114,8 +121,9 @@ The development defaults in `.env.example` are enough to run the current in-memo
 | `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | R2 API token credentials with object read/write access only to the Ruffl bucket. |
 | `R2_BUCKET` | R2 bucket name, normally `ruffl-media`. |
 | `R2_PUBLIC_URL` | HTTPS custom domain or public-bucket origin used to read uploaded media. |
-| `RESEND_API_KEY` | Future email-service credential. |
-| `EXPO_ACCESS_TOKEN` | Future Expo push-notification credential. |
+| `RESEND_API_KEY` | Resend sending credential. It is required in production. |
+| `EMAIL_FROM` | Verified sender in `Friendly name <address@domain>` form. It is required with `RESEND_API_KEY`. |
+| `EXPO_ACCESS_TOKEN` | Expo account access token used to authenticate push-ticket and receipt requests. It is required in production. |
 | `SENTRY_DSN` | Backend project DSN. It is required in production. A DSN is not the Sentry auth token. |
 | `SENTRY_ENVIRONMENT` | Environment label such as `development`, `staging`, or `production`. |
 | `SENTRY_RELEASE` | Release identifier, ideally the deployed Git commit SHA. |
@@ -144,6 +152,7 @@ PORT=3000
 HOST=0.0.0.0
 NODE_ENV=production
 JWT_SECRET=<at-least-48-random-bytes>
+BACKEND_PUBLIC_URL=https://backend.ruffl.thomaswhite.me
 CORS_ORIGINS=https://admin.ruffl.thomaswhite.me
 SEED_DEMO_DATA=false
 
@@ -163,8 +172,9 @@ SENTRY_ENVIRONMENT=production
 SENTRY_RELEASE=ruffl-backend@<git-sha>
 SENTRY_TRACES_SAMPLE_RATE=0.1
 
-RESEND_API_KEY=
-EXPO_ACCESS_TOKEN=
+RESEND_API_KEY=<resend-sending-api-key>
+EMAIL_FROM=Ruffl <notifications@ruffl.thomaswhite.me>
+EXPO_ACCESS_TOKEN=<expo-account-access-token>
 ADMIN_EMAIL=support@ruffl.thomaswhite.me
 ```
 
@@ -173,13 +183,15 @@ ADMIN_EMAIL=support@ruffl.thomaswhite.me
 - Nginx or Caddy should proxy `https://backend.ruffl.thomaswhite.me` to `http://127.0.0.1:3000`. Do not expose port 3000 through the Oracle firewall.
 - `NODE_ENV=production` activates fail-closed configuration checks.
 - `JWT_SECRET` signs sessions. Generate it with `node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"` and never rotate it without intentionally signing everyone out.
+- `BACKEND_PUBLIC_URL` must be exactly `https://backend.ruffl.thomaswhite.me`; verification and reset emails open pages on this origin.
 - Only the browser-hosted admin origin belongs in `CORS_ORIGINS`. The native mobile app does not need a CORS entry.
 - `SEED_DEMO_DATA=false` is mandatory in production.
 - `DATABASE_URL` is the restricted runtime login. `DATABASE_MIGRATION_URL` is the more privileged schema owner used briefly at container startup.
 - If the same database login must do both jobs, leave `DATABASE_MIGRATION_URL` and `DATABASE_RUNTIME_ROLE` blank, but understand that this gives the API broader database authority.
 - `R2_PUBLIC_URL` must be the HTTPS read origin attached to the exact bucket in `R2_BUCKET`.
 - `SENTRY_DSN` is a public ingestion address from the backend Sentry project. Do not put the `sntryu_...` API auth token here.
-- `RESEND_API_KEY` and `EXPO_ACCESS_TOKEN` remain blank because those delivery adapters are not implemented yet.
+- `RESEND_API_KEY` must be a restricted sending key. `EMAIL_FROM` must use a domain verified in Resend.
+- `EXPO_ACCESS_TOKEN` authenticates backend requests to the Expo Push Service. Create it in the Expo account that owns the Ruffl EAS project and keep it only on the backend.
 - `ADMIN_EMAIL` does not create an admin by itself; use the bootstrap command below with a temporary `ADMIN_PASSWORD`.
 
 ## 4. Start the API
@@ -215,6 +227,57 @@ These accounts are created when `SEED_DEMO_DATA=true`:
 - Demo accounts are development data and must not be enabled in production.
 - Public signup cannot create an admin account.
 
+## Email verification and password recovery
+
+Production requires verified email ownership:
+
+- A public signup creates an unverified account and sends a 24-hour verification link.
+- The API does not issue a login token until the user confirms that link.
+- **Resend verification email** sends a replacement link without revealing whether an address is registered.
+- **Forgot password** always returns the same message. A matching non-deleted account receives a 30-minute reset link.
+- Verification, reset, and admin CSRF tokens are scoped and cannot be used as bearer sessions.
+- Every bearer session is bound to the current password credential. A successful password reset immediately invalidates that link, every older reset link, and every previously issued 30-day session.
+- Account-link tokens are stored in the URL fragment, removed from the address bar by the account page, and are not included in the backend request URL or normal access logs.
+
+Local development does not require real email. With `NODE_ENV=development` and no Resend settings, new accounts are automatically verified so the basic demo remains quick to use. Recovery requests return a clearly labelled development-only link that the mobile app can open. This development convenience is never returned in production or tests.
+
+To configure production email:
+
+1. Create a Resend account.
+2. In **Domains**, add a domain or transactional subdomain you control. Add the SPF and DKIM DNS records shown by Resend and wait until the domain is verified.
+3. Create a sending-only API key.
+4. Set `RESEND_API_KEY` on the VPS.
+5. Set `EMAIL_FROM`, for example `Ruffl <notifications@ruffl.thomaswhite.me>`. The address must belong to the verified domain.
+6. Set `BACKEND_PUBLIC_URL=https://backend.ruffl.thomaswhite.me`.
+7. Restart the backend and create a non-demo test account using an inbox you control.
+8. Verify signup, resend, forgot-password, successful reset, expired/reused-link rejection, and login with the new password.
+
+Do not put the Resend API key in the mobile app, admin dashboard, GitHub Pages variables, or an `EXPO_PUBLIC_*` value.
+
+## Expo push notifications
+
+The backend converts new in-app notifications into Expo push deliveries when the recipient has enabled notifications on a Ruffl development, preview, or production build:
+
+- The notification and delivery record are committed in the same database mutation.
+- The worker sends queued deliveries to Expo and stores the returned ticket ID.
+- It checks Expo receipts after fifteen minutes instead of treating an accepted ticket as final delivery.
+- Temporary HTTP and Expo rate-limit errors are retried with exponential backoff, up to five attempts.
+- `DeviceNotRegistered` permanently fails that delivery and removes the rejected token so later activity does not repeatedly target an uninstalled app.
+- Completed delivery records are retained for thirty days for diagnosis.
+
+Configure production delivery:
+
+1. In `Ruffl-Frontend`, run `npx eas-cli@latest login` and `npx eas-cli@latest init` so `app.json` contains the EAS project ID.
+2. In the Expo account settings, create an access token for the account that owns that project.
+3. Enable enhanced push security for the Expo project.
+4. Set the token as `EXPO_ACCESS_TOKEN` only in the backend VPS `.env`.
+5. Configure Android FCM v1 and iOS APNs credentials through EAS, then create a development or preview build. Expo Go cannot verify Ruffl's remote-notification integration.
+6. Sign in on that build, open **Profile**, and select **Enable push notifications**.
+7. Background the app and send a direct message from the other demo role.
+8. Confirm the device receives the alert and inspect the `push_delivery` row if it does not.
+
+The current account model stores one active Expo token per user. Enabling notifications on another device replaces the previous device token. Multi-device delivery requires a separate device-registration table and is not yet implemented.
+
 ## Start the complete system locally
 
 Use a separate PowerShell window for each process:
@@ -249,7 +312,9 @@ npm test
 npm run build
 ```
 
-Most tests use Fastify request injection and do not open a port. They cover public admin escalation, malformed input, browser CORS preflights, commit/rollback, immediate suspension/deletion enforcement, private cross-account communication, notification acknowledgement, lifecycle permissions, and exact milestone payment allocation. `postgres-store.integration.test.ts` runs against the PostgreSQL 17 service in GitHub Actions and proves that accounts and messages survive an API restart; it is skipped locally when `TEST_DATABASE_URL` is absent.
+Most tests use Fastify request injection and do not open a port. They cover public admin escalation, malformed input, one-use email verification and password recovery, browser CORS preflights, commit/rollback, immediate suspension/deletion enforcement, private cross-account communication, notification acknowledgement, push queuing/tickets/receipts, lifecycle permissions, and exact milestone payment allocation. `postgres-store.integration.test.ts` runs against the PostgreSQL 17 service in GitHub Actions and proves that accounts, verified-email state, and messages survive an API restart; it is skipped locally when `TEST_DATABASE_URL` is absent.
+
+`npm run dev` loads the repository's ignored `.env` file automatically. If development startup unexpectedly tries to connect to PostgreSQL, R2, or Resend, remove placeholder values from those integration settings rather than using example hostnames or credentials.
 
 ## Rate limits
 
@@ -260,6 +325,9 @@ Rate limits reduce automated abuse. They are applied to the client IP address, s
 | All API requests | 100 requests per minute per IP |
 | Signup | 5 attempts per hour per IP |
 | Login | 10 attempts per 15 minutes per IP |
+| Resend verification email | 3 attempts per hour per IP |
+| Forgot password | 3 attempts per hour per IP |
+| Submit password reset | 5 attempts per hour per IP |
 | Upload slots | 20 attempts per hour per IP |
 
 - A rejected login still counts as an attempt.
@@ -323,10 +391,11 @@ The database user in `ADMIN_DATABASE_URL` must be a member of `ruffl_admin_role_
 2. Create an R2 API token restricted to object read/write for that bucket; do not use a global Cloudflare API key.
 3. Attach a custom read domain such as `media.ruffl.thomaswhite.me` and require HTTPS.
 4. Put the account ID, token credentials, bucket, and read domain into the five `R2_*` variables.
-5. Configure bucket CORS for `PUT` with the `Content-Type` header from clients that perform browser uploads. Native Android/iOS requests are not browser CORS requests, but the web build and future browser tools are.
-6. Call `POST /uploads/slot`, upload one small permitted image to the returned `uploadUrl` with the returned headers, and confirm `publicUrl` serves that exact object.
+5. Configure bucket CORS for `PUT` with the `Content-Type` header from the exact browser origins that may upload. Native Android/iOS requests are not browser CORS requests. Do not use a wildcard origin with authenticated production tools.
+6. In the mobile app, open a message, milestone update, dispute, or profile and select an image. The app calls `POST /uploads/slot`, uploads the file directly to R2 using the returned headers, and sends the resulting attachment URL with the next API mutation.
+7. Confirm the image appears for the other conversation participant and that an attempted URL from another account is rejected with `INVALID_MEDIA_URL`.
 
-The API allows JPEG, PNG, WebP, and GIF images up to 10 MiB; MP4, QuickTime, and WebM videos up to 100 MiB; and the listed document types up to 25 MiB. Signed URLs expire after five minutes. The API never returns development placeholder upload URLs.
+The API allows JPEG, PNG, WebP, and GIF images up to 10 MiB; MP4, QuickTime, and WebM videos up to 100 MiB; and the listed document types up to 25 MiB. The current mobile picker intentionally exposes images only. Signed upload URLs expire after five minutes and bind both the declared byte length and content type, so changing either makes R2 reject the PUT. The API never returns development placeholder upload URLs and rejects attachment/avatar/banner URLs outside the authenticated user's issued object path.
 
 ## Docker deployment
 
@@ -340,8 +409,130 @@ docker run --env-file .env -p 3000:3000 ruffl-api
 - `docker build` creates an image named `ruffl-api`.
 - `docker run` starts a container and maps computer port `3000` to container port `3000`.
 - The image runs `npm run db:migrate` before `npm start`; an invalid migration stops the new container instead of starting against an unknown schema.
+- Migration `004_dispute_resume.sql` records the commission status that existed before a dispute. Non-cancellation decisions restore that exact status so work can continue; a cancellation decision remains cancelled.
+- Migration `005_repeat_disputes.sql` removes the original one-case-per-commission constraint so a later independent issue can be reviewed without a database error.
+- Migration `006_admin_audit.sql` adds the durable moderation/dispute audit trail shown in the admin dashboard.
+- Docker Compose checks `/ready`, and the deployment workflow waits up to three minutes for the new container to become healthy. A failed migration, database connection, or startup configuration therefore fails the GitHub deployment job and prints the latest API logs.
 - Use a production `.env`, not the development demo configuration.
 - Put the API behind HTTPS using a hosting platform or reverse proxy.
+
+## GitHub Actions deployment to the Oracle VPS
+
+The included workflows make `main` the production source of truth:
+
+- **CI** runs for every pull request and every push to `main`. It installs the lockfile, starts PostgreSQL 17, runs the real persistence test, type-checks, tests, and builds.
+- **Deploy Backend** listens for a successful **CI** run caused by a push to `main`. Pull-request CI can never deploy.
+- Deployments are serialized, use a read-only GitHub token, and pin the third-party SSH action to the reviewed `v1.2.2` commit rather than a mutable tag.
+- The VPS checks out the exact commit that passed CI, builds the image, applies migrations, and waits for `/ready` before the job succeeds.
+
+### 1. Prepare the VPS deployment user
+
+Install Git, Docker Engine, and the Docker Compose plugin. Follow [Docker's current operating-system installation guide](https://docs.docker.com/engine/install/) for the VPS instead of pasting an unverified third-party install script.
+
+The deployment user must:
+
+- be able to connect with an SSH key;
+- own `~/Ruffl-Backend`;
+- be able to run `docker compose` without an interactive password prompt;
+- not be the `root` user;
+- have the production `.env` at `~/Ruffl-Backend/.env`.
+
+Membership of the Docker group is effectively root-level host access. Use this account and key only for Ruffl deployment, restrict who can change the `main` branch/workflows, and do not run untrusted pull-request code through this SSH key.
+
+Clone the repository once:
+
+```bash
+cd ~
+git clone https://github.com/ThomasWCode/Ruffl-Backend.git
+cd Ruffl-Backend
+cp .env.example .env
+```
+
+Edit `.env` directly on the VPS and complete every production value from the earlier Oracle VPS section. `.env` is ignored by Git, so the workflow's exact-commit checkout does not replace it.
+
+Confirm the installed Compose version supports deployment health waiting:
+
+```bash
+docker compose version
+```
+
+Use Docker Compose 2.20 or newer.
+
+### 2. Create a dedicated SSH key
+
+On your own computer, create a key used only by GitHub Actions:
+
+```powershell
+ssh-keygen -t ed25519 -C "ruffl-github-deploy" -f .\ruffl-github-deploy
+```
+
+- Add the contents of `ruffl-github-deploy.pub` to the deployment user's `~/.ssh/authorized_keys` on the VPS.
+- Keep `ruffl-github-deploy` private. Do not commit either key to a Ruffl repository.
+- Test the public key before adding it to GitHub.
+
+### 3. Add GitHub Actions secrets
+
+In **Ruffl-Backend > Settings > Secrets and variables > Actions > Secrets**, add:
+
+| Secret | Value |
+|---|---|
+| `HOST` | The Oracle VPS public IP address or SSH hostname |
+| `USERNAME` | The limited deployment user's Linux username |
+| `SSH_PRIVATE_KEY` | The complete multiline contents of the private deployment key |
+
+Do not add the VPS `.env`, JWT secret, database URL, R2 keys, Resend key, Expo token, or Sentry DSN as workflow secrets. The workflow never needs those values; Docker reads them from the protected `.env` already on the VPS.
+
+### 4. Run and verify the first deployment
+
+1. Open the repository's **Actions** tab and confirm **CI** and **Deploy Backend** are listed.
+2. Push a reviewed commit to `main`.
+3. Wait for **CI** to pass. **Deploy Backend** then starts automatically.
+4. Open the deployment log and confirm `docker compose ps` reports the API as healthy.
+5. Check `https://backend.ruffl.thomaswhite.me/health`.
+6. Check `https://backend.ruffl.thomaswhite.me/ready`; production must report `"storage":"postgres"` and `"pushDelivery":"configured"`.
+
+There is no Pages source or starter workflow to select for the backend. GitHub discovers the two existing YAML files automatically. If Actions are disabled, enable them under **Settings > Actions > General**.
+
+If a deployment fails, the job prints the latest 100 API log lines and leaves a red Actions result. Fix or revert through a new reviewed commit on `main`; do not force-push production history or manually point the VPS at an untested commit.
+
+## HTTPS reverse proxy and Oracle firewall
+
+Compose exposes the container only at `127.0.0.1:3000`, so the public domain needs one HTTPS reverse proxy. A minimal Nginx site looks like:
+
+```nginx
+server {
+    listen 80;
+    server_name backend.ruffl.thomaswhite.me;
+
+    client_max_body_size 1m;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 60s;
+    }
+}
+```
+
+- Save the site using the path/convention for the VPS operating system, validate it with `sudo nginx -t`, then reload Nginx.
+- Obtain and renew a trusted TLS certificate using [Certbot's current Nginx instructions](https://certbot.eff.org/instructions) or another maintained ACME client.
+- Redirect HTTP to HTTPS after certificate setup.
+- In both the Oracle Cloud network security list and the operating-system firewall, allow public TCP 80/443. Restrict TCP 22 to trusted administration addresses where practical. Do not expose TCP 3000 publicly.
+- Fastify trusts one proxy hop. The example deliberately overwrites `X-Forwarded-For` with Nginx's observed client address so a direct client cannot choose the rate-limit identity.
+- If the DNS record is proxied through Cloudflare, Nginx sees Cloudflare rather than the original client. Configure Cloudflare's authenticated real-IP handling before relying on per-IP rate limits, or initially use a DNS-only record. Do not simply trust arbitrary incoming `CF-Connecting-IP` headers.
+
+After TLS is active:
+
+```bash
+curl --fail https://backend.ruffl.thomaswhite.me/health
+curl --fail https://backend.ruffl.thomaswhite.me/ready
+```
+
+The first checks that the process responds. The second also checks the database connection and reports the active storage/push configuration.
 
 ## Production checklist
 
@@ -351,10 +542,12 @@ docker run --env-file .env -p 3000:3000 ruffl-api
 - Restrict `CORS_ORIGINS` to the exact deployed dashboard origins.
 - Use a public HTTPS API URL.
 - Confirm `/ready` returns `"storage":"postgres"` before routing traffic.
+- Confirm the VPS has Docker Compose 2.20 or newer so the deployment's `--wait` and `--wait-timeout` checks are available.
 - Create the first admin with `npm run db:bootstrap-admin`.
 - Configure and test R2 upload CORS, object access, and lifecycle rules.
 - Set a backend Sentry DSN and verify a test error appears in the correct environment.
-- Connect email and push-notification providers before relying on out-of-app alerts.
+- Verify the Resend sending domain and test signup verification and password recovery end to end.
+- Configure an Expo access token, EAS project ID, FCM/APNs credentials, and a real-device push test before relying on out-of-app commission or support alerts.
 - Use a durable/shared rate-limit store when running more than one API instance.
 - Back up the database and test restoration.
 - Keep the API database account separate from the privileged admin-role operator.
@@ -365,20 +558,27 @@ docker run --env-file .env -p 3000:3000 ruffl-api
 - **Port 3000 is already in use:** Stop the other backend process or change `PORT` and update both frontend API URLs.
 - **The phone cannot connect:** Do not use `localhost` on a physical phone. Use the computer's IPv4 address and check the firewall and Wi-Fi network.
 - **The admin dashboard reports a CORS error:** Add the dashboard's exact origin to `CORS_ORIGINS`, ensure methods such as `DELETE` are permitted by the current backend code, and restart the backend.
-- **Login returns 403:** Check the credentials and whether the user is suspended or deleted.
+- **Login returns 403:** Check whether the email is unverified or the user is suspended/deleted. `EMAIL_NOT_VERIFIED` means the user should request another verification email.
 - **Login returns 429:** The IP exceeded the login-attempt limit. Wait for the window to expire; during local development, a server restart clears the in-memory counter.
 - **`relation ... does not exist`:** Build the image with the `database/` directory and run `npm run db:migrate` using a role allowed to create the schema.
 - **`new row violates row-level security`:** Set `DATABASE_RUNTIME_ROLE` to the exact runtime PostgreSQL role and rerun migrations with the privileged migration connection.
 - **`Cloudflare R2 configuration is required`:** Production requires all five `R2_*` settings. Partial R2 settings are rejected.
+- **`Resend email configuration is required`:** Production requires both `RESEND_API_KEY` and `EMAIL_FROM`, and the sender domain must be verified in Resend.
+- **`Expo Push access configuration is required`:** Production requires `EXPO_ACCESS_TOKEN`; use an access token from the Expo account that owns the Ruffl project, not a device push token.
+- **Push is enabled but no alert arrives:** Confirm the mobile build has an EAS project ID and platform credentials, the user has granted notification permission, `/ready` reports `"pushDelivery":"configured"`, and the latest `push_delivery` record has not failed with `DeviceNotRegistered`.
+- **Verification/reset email never arrives:** Confirm the Resend domain is verified, inspect the Resend email log, check spam, and verify `BACKEND_PUBLIC_URL` uses the public HTTPS backend origin.
 - **`MEDIA_NOT_CONFIGURED` locally:** Add R2 development credentials or test non-upload flows; fake upload URLs are no longer returned.
+- **`INVALID_MEDIA_URL`:** Request a fresh upload slot while signed in and submit the returned `publicUrl`. Arbitrary websites, a different account's R2 path, query strings, and fragments are rejected.
 - **Changes disappeared after restart:** `/ready` will report `"storage":"memory"` when local development is not using `DATABASE_URL`.
 - **`npm install` fails:** Confirm the Node version, then run `npm install` again from this repository directory. Do not copy another repository's `node_modules`.
 
 ## Honest implementation boundary
 
-- PostgreSQL persistence, R2 signing, and backend Sentry reporting are implemented, but the production credentials and first admin must still be provisioned by the operator.
+- PostgreSQL persistence, R2 signing, Resend account email, Expo push delivery, and backend Sentry reporting are implemented, but production credentials, DNS verification, EAS platform credentials, and the first admin must still be provisioned by the operator.
 - The PostgreSQL adapter keeps an in-process cache and serializes writes. Run exactly one API replica. Horizontal scaling requires replacing this cache/diff adapter with query-based repositories or coordinated cache invalidation.
-- Resend email and Expo Push delivery are not implemented. Users receive in-app notifications and polling, but no password-reset email or out-of-app push alert exists yet.
-- Media upload signing exists, but the current mobile screens do not yet contain a native file-picker/upload experience.
+- Email verification and password reset use Resend. Expo push ticket/receipt handling is implemented, but it still needs a real EAS development build and provisioned FCM/APNs credentials before delivery can be claimed on physical devices.
+- Push registration currently supports one device per account; signing in and enabling notifications on another device replaces the earlier token.
+- Native image selection/upload is implemented for messages, milestone progress, disputes, and profile images. Video and document selection are not exposed yet.
+- Uploaded objects use unguessable paths on the configured public read domain. Anyone who obtains a complete media URL can read it, and canceling after upload can leave an unreferenced object. A future upload registry/private download-authorisation layer is required before Ruffl should accept highly sensitive identity documents.
 - No payment processor is integrated. Deposit and milestone actions are symbolic.
 - Database backups, restore drills, VPS firewalling, reverse-proxy configuration, and secret rotation are operator responsibilities and must be completed before accepting real user data.
