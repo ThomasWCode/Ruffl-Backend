@@ -1,8 +1,21 @@
 services:
   api:
+    image: ruffl-backend-api:production
     build: .
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      SENTRY_RELEASE: ${SENTRY_RELEASE:-}
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:3000/ready').then((response)=>{if(!response.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"

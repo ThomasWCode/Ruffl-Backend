@@ -1,5 +1,3 @@
-begin;
-
 create extension if not exists pgcrypto;
 
 create type public.user_role as enum ('commissioner', 'maker', 'admin');
@@ -253,5 +251,3 @@ alter table public.dispute enable row level security;
 alter table public.dispute_evidence enable row level security;
 alter table public.admin_warning enable row level security;
 alter table public.notification enable row level security;
-
-commit;

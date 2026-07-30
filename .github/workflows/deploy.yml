@@ -1,17 +1,31 @@
 name: Deploy Backend
 
 on:
-  push:
+  workflow_run:
+    workflows:
+      - CI
+    types:
+      - completed
     branches:
       - main
 
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-production
+  cancel-in-progress: false
+
 jobs:
   deploy:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push'
     runs-on: ubuntu-latest
 
     steps:
       - name: Deploy over SSH
-        uses: appleboy/ssh-action@v1.2.2
+        uses: appleboy/ssh-action@2ead5e36573f08b82fbfce1504f1a4b05a647c6f # v1.2.2
 
         with:
           host: ${{ secrets.HOST }}
@@ -19,7 +33,45 @@ jobs:
           key: ${{ secrets.SSH_PRIVATE_KEY }}
 
           script: |
+            set -eu
             cd ~/Ruffl-Backend
+            previous_sha="$(git rev-parse HEAD)"
+            previous_container="$(docker compose ps -q api 2>/dev/null || true)"
+            previous_image=""
+            previous_image_name=""
+            if [ -n "$previous_container" ]; then
+              previous_image="$(docker inspect --format='{{.Image}}' "$previous_container" 2>/dev/null || true)"
+              previous_image_name="$(docker inspect --format='{{.Config.Image}}' "$previous_container" 2>/dev/null || true)"
+            fi
+            export SENTRY_RELEASE="ruffl-backend@${{ github.event.workflow_run.head_sha }}"
             git fetch origin
-            git reset --hard origin/main
-            docker compose up -d --build
+            git reset --hard ${{ github.event.workflow_run.head_sha }}
+            docker compose build api
+            if ! docker compose up -d --wait --wait-timeout 180 api; then
+              docker compose ps
+              docker compose logs --tail=100 api
+              if [ -n "$previous_image" ]; then
+                rollback_image_name="${previous_image_name:-ruffl-backend-api:production}"
+                docker image tag "$previous_image" "$rollback_image_name"
+                git reset --hard "$previous_sha"
+                export SENTRY_RELEASE="ruffl-backend@$previous_sha"
+                if ! docker compose up -d --no-build --force-recreate --wait --wait-timeout 180 api; then
+                  docker compose ps
+                  docker compose logs --tail=100 api
+                  exit 1
+                fi
+              fi
+              exit 1
+            fi
+            docker compose ps
+
+      - name: Verify public readiness
+        env:
+          EXPECTED_RELEASE: ruffl-backend@${{ github.event.workflow_run.head_sha }}
+        run: >-
+          curl --fail --silent --show-error
+          --retry 12 --retry-all-errors --retry-delay 5
+          https://backend.ruffl.thomaswhite.me/ready
+          | jq --exit-status --arg release "$EXPECTED_RELEASE"
+          '.status == "ready" and .storage == "postgres" and
+          .pushDelivery == "configured" and .release == $release'

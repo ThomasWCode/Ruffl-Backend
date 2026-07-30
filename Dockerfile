@@ -12,6 +12,7 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 COPY --from=build /app/dist ./dist
+COPY database ./database
 USER node
 EXPOSE 3000
-CMD ["node", "dist/server.js"]
+CMD ["npm", "run", "start:production"]

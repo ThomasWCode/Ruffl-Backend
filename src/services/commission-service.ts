@@ -281,8 +281,14 @@ export class CommissionService {
   cancel(user: User, commissionId: string): Commission {
     const commission = this.get(commissionId);
     assertParty(commission, user.id);
-    if (['complete', 'cancelled', 'disputed'].includes(commission.status)) {
-      throw new DomainError('This commission can no longer be cancelled.');
+    if (
+      !['pending', 'negotiating', 'price_proposed', 'accepted'].includes(
+        commission.status,
+      )
+    ) {
+      throw new DomainError(
+        'After a deposit is recorded, cancellation requires a dispute and human review.',
+      );
     }
     commission.status = 'cancelled';
     commission.updatedAt = now();
@@ -339,7 +345,12 @@ export class CommissionService {
   ): Dispute {
     const commission = this.get(commissionId);
     assertParty(commission, user.id);
-    if (['complete', 'cancelled', 'disputed'].includes(commission.status) || !explanation.trim()) {
+    if (
+      commission.status === 'complete' ||
+      commission.status === 'cancelled' ||
+      commission.status === 'disputed' ||
+      !explanation.trim()
+    ) {
       throw new DomainError('This commission cannot be disputed.');
     }
     const timestamp = now();
@@ -361,6 +372,7 @@ export class CommissionService {
       createdAt: timestamp,
     };
     this.store.disputes.set(dispute.id, dispute);
+    commission.statusBeforeDispute = commission.status;
     commission.status = 'disputed';
     commission.updatedAt = timestamp;
     this.createDisputeConversation(commission, dispute);
@@ -421,7 +433,11 @@ export class CommissionService {
     const commission = this.get(dispute.commissionId);
     if (outcome === 'commission_cancelled') {
       commission.status = 'cancelled';
+    } else {
+      commission.status = commission.statusBeforeDispute ?? 'active';
     }
+    delete commission.statusBeforeDispute;
+    commission.updatedAt = now();
     this.notify(commission.makerId, 'dispute_resolved', 'Dispute resolved', resolution);
     this.notify(commission.commissionerId, 'dispute_resolved', 'Dispute resolved', resolution);
     return dispute;
