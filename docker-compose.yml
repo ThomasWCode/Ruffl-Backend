@@ -1,9 +1,12 @@
 services:
   api:
+    image: ruffl-backend-api:production
     build: .
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      SENTRY_RELEASE: ${SENTRY_RELEASE:-}
     healthcheck:
       test:
         - CMD

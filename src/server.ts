@@ -14,6 +14,9 @@ if (nodeEnv === 'production' && !databaseUrl) {
 if (nodeEnv === 'production' && !process.env.SENTRY_DSN?.trim()) {
   throw new Error('SENTRY_DSN is required in production.');
 }
+if (nodeEnv === 'production' && !process.env.SENTRY_RELEASE?.trim()) {
+  throw new Error('SENTRY_RELEASE is required in production.');
+}
 
 const store = databaseUrl
   ? await PostgresStore.connect(databaseUrl)

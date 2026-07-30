@@ -126,7 +126,7 @@ The development defaults in `.env.example` are enough to run the current in-memo
 | `EXPO_ACCESS_TOKEN` | Expo account access token used to authenticate push-ticket and receipt requests. It is required in production. |
 | `SENTRY_DSN` | Backend project DSN. It is required in production. A DSN is not the Sentry auth token. |
 | `SENTRY_ENVIRONMENT` | Environment label such as `development`, `staging`, or `production`. |
-| `SENTRY_RELEASE` | Release identifier, ideally the deployed Git commit SHA. |
+| `SENTRY_RELEASE` | Release identifier. The deployment workflow overrides this with the exact deployed Git commit SHA. |
 | `SENTRY_TRACES_SAMPLE_RATE` | Fraction from `0` to `1` of performance transactions sent to Sentry. |
 | `ADMIN_EMAIL` | Email used by the one-time admin bootstrap command. |
 
@@ -169,7 +169,7 @@ R2_PUBLIC_URL=https://media.ruffl.thomaswhite.me
 
 SENTRY_DSN=<ruffl-backend-project-dsn>
 SENTRY_ENVIRONMENT=production
-SENTRY_RELEASE=ruffl-backend@<git-sha>
+SENTRY_RELEASE=ruffl-backend@manual
 SENTRY_TRACES_SAMPLE_RATE=0.1
 
 RESEND_API_KEY=<resend-sending-api-key>
@@ -413,6 +413,8 @@ docker run --env-file .env -p 3000:3000 ruffl-api
 - Migration `005_repeat_disputes.sql` removes the original one-case-per-commission constraint so a later independent issue can be reviewed without a database error.
 - Migration `006_admin_audit.sql` adds the durable moderation/dispute audit trail shown in the admin dashboard.
 - Docker Compose checks `/ready`, and the deployment workflow waits up to three minutes for the new container to become healthy. A failed migration, database connection, or startup configuration therefore fails the GitHub deployment job and prints the latest API logs.
+- The workflow keeps the previously running image until the replacement is healthy. If local readiness fails, it restores the previous Git commit and image, checks that rollback for health, and still marks the deployment red so the failed release is investigated.
+- After local container readiness succeeds, the GitHub runner checks the public HTTPS `/ready` endpoint. It requires PostgreSQL storage, configured push delivery, and the exact commit-specific release identifier.
 - Use a production `.env`, not the development demo configuration.
 - Put the API behind HTTPS using a hosting platform or reverse proxy.
 
@@ -423,7 +425,8 @@ The included workflows make `main` the production source of truth:
 - **CI** runs for every pull request and every push to `main`. It installs the lockfile, starts PostgreSQL 17, runs the real persistence test, type-checks, tests, and builds.
 - **Deploy Backend** listens for a successful **CI** run caused by a push to `main`. Pull-request CI can never deploy.
 - Deployments are serialized, use a read-only GitHub token, and pin the third-party SSH action to the reviewed `v1.2.2` commit rather than a mutable tag.
-- The VPS checks out the exact commit that passed CI, builds the image, applies migrations, and waits for `/ready` before the job succeeds.
+- The VPS checks out the exact commit that passed CI, builds the image, applies migrations, and waits for both local and public `/ready` checks before the job succeeds.
+- The workflow injects `SENTRY_RELEASE=ruffl-backend@<exact-commit-sha>` into the container. The public readiness response exposes the same non-secret release identifier for deployment verification.
 
 ### 1. Prepare the VPS deployment user
 
@@ -489,11 +492,13 @@ Do not add the VPS `.env`, JWT secret, database URL, R2 keys, Resend key, Expo t
 3. Wait for **CI** to pass. **Deploy Backend** then starts automatically.
 4. Open the deployment log and confirm `docker compose ps` reports the API as healthy.
 5. Check `https://backend.ruffl.thomaswhite.me/health`.
-6. Check `https://backend.ruffl.thomaswhite.me/ready`; production must report `"storage":"postgres"` and `"pushDelivery":"configured"`.
+6. Check `https://backend.ruffl.thomaswhite.me/ready`; production must report `"storage":"postgres"`, `"pushDelivery":"configured"`, and the deployed commit in `"release"`.
 
 There is no Pages source or starter workflow to select for the backend. GitHub discovers the two existing YAML files automatically. If Actions are disabled, enable them under **Settings > Actions > General**.
 
 If a deployment fails, the job prints the latest 100 API log lines and leaves a red Actions result. Fix or revert through a new reviewed commit on `main`; do not force-push production history or manually point the VPS at an untested commit.
+
+The automated rollback restores the prior application image, not the prior database contents. Keep every production migration transactional and backward-compatible with the previous application release. Never edit a migration that has already run.
 
 ## HTTPS reverse proxy and Oracle firewall
 

@@ -28,6 +28,25 @@ describe('request persistence boundary', () => {
     await Promise.all(apps.splice(0).map((app) => app.close()));
   });
 
+  it('reports the running release through readiness', async () => {
+    const app = await buildApp({
+      store: new RecordingStore(),
+      jwtSecret: 'test-secret',
+      release: 'ruffl-backend@test-sha',
+    });
+    apps.push(app);
+
+    const response = await app.inject({ method: 'GET', url: '/ready' });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      status: 'ready',
+      service: 'ruffl-api',
+      storage: 'memory',
+      release: 'ruffl-backend@test-sha',
+    });
+  });
+
   it('commits a successful mutation once', async () => {
     const store = new RecordingStore();
     const app = await buildApp({ store, jwtSecret: 'test-secret' });

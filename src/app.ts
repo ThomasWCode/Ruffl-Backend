@@ -85,6 +85,7 @@ interface AppOptions {
   requireEmailVerification?: boolean;
   pushGateway?: PushGateway | null;
   mediaGateway?: MediaGateway | null;
+  release?: string;
 }
 
 const activeStatuses = ['pending', 'negotiating', 'price_proposed', 'accepted', 'active', 'shipping', 'disputed'];
@@ -469,6 +470,10 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     process.env.BACKEND_PUBLIC_URL ??
     'http://localhost:3000'
   ).replace(/\/$/, '');
+  const release =
+    options.release?.trim() ||
+    process.env.SENTRY_RELEASE?.trim() ||
+    'ruffl-backend@local';
   const corsOrigins =
     options.corsOrigins ??
     process.env.CORS_ORIGINS?.split(',').map((origin) => origin.trim()).filter(Boolean) ??
@@ -773,6 +778,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       service: 'ruffl-api',
       storage: store.persistent ? 'postgres' : 'memory',
       pushDelivery: pushWorker ? 'configured' : 'disabled',
+      release,
     };
   });
 
