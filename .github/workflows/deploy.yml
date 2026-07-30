@@ -38,8 +38,10 @@ jobs:
             previous_sha="$(git rev-parse HEAD)"
             previous_container="$(docker compose ps -q api 2>/dev/null || true)"
             previous_image=""
+            previous_image_name=""
             if [ -n "$previous_container" ]; then
               previous_image="$(docker inspect --format='{{.Image}}' "$previous_container" 2>/dev/null || true)"
+              previous_image_name="$(docker inspect --format='{{.Config.Image}}' "$previous_container" 2>/dev/null || true)"
             fi
             export SENTRY_RELEASE="ruffl-backend@${{ github.event.workflow_run.head_sha }}"
             git fetch origin
@@ -49,7 +51,8 @@ jobs:
               docker compose ps
               docker compose logs --tail=100 api
               if [ -n "$previous_image" ]; then
-                docker image tag "$previous_image" ruffl-backend-api:production
+                rollback_image_name="${previous_image_name:-ruffl-backend-api:production}"
+                docker image tag "$previous_image" "$rollback_image_name"
                 git reset --hard "$previous_sha"
                 export SENTRY_RELEASE="ruffl-backend@$previous_sha"
                 if ! docker compose up -d --no-build --force-recreate --wait --wait-timeout 180 api; then
